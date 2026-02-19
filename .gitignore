@@ -1,0 +1,20 @@
+# PlatformIO build/system
+.pio/
+.pio-core/
+
+# Local library mirrors (reference-only, not tracked)
+libraries/
+
+# Local secrets (do not commit)
+include/secrets.h
+
+# Logs and local runtime artifacts
+*.log
+log/
+sessions/
+history.jsonl
+auth.json
+
+# Environment files
+.env
+.env.*
