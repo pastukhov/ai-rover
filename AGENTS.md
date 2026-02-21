@@ -30,6 +30,16 @@
   3. Manual smoke test on hardware (buttons, movement, display, battery text, emergency stop).
 - If adding scripts/tools, include a small reproducible smoke-check command in `docs/`.
 
+## Observability & Logs
+- Rover firmware logs are shipped via syslog and visible in Loki.
+- Current syslog target reported by firmware boot logs: `192.168.11.2:514`.
+- Preferred Loki selector for rover logs: `{host="ai-rover", application="firmware", job="syslog"}`.
+- Typical healthy boot sequence in logs includes lines similar to:
+  - `Syslog enabled: 192.168.11.2:514`
+  - `Web server started: http://<ip>/`
+  - `AI tools: READY (ESP_OK)`
+  - periodic `HB ... action=... battery=...`
+
 ## Subagent Roles
 - `planner` — converts `todo.md` into explicit implementation steps, acceptance criteria, and command checklist (`pio run`, upload, monitor).
 - `doc-reader` — reads all relevant `CLAUDE.md` and library headers/examples to extract allowed APIs before code changes.
