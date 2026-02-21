@@ -2,6 +2,8 @@
 #include "M5_RoverC.h"
 #include <cstring>
 #include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_sleep.h>
 #include <WebServer.h>
 #include "secrets.h"
 
@@ -9,9 +11,13 @@ namespace {
 
 constexpr int8_t kSpeedPercent = 100;
 constexpr int8_t kWebSpeedPercent = 80;
-constexpr uint8_t kGripperServo = 0;
-constexpr uint8_t kGripperOpenAngle = 90;
-constexpr uint8_t kGripperCloseAngle = 10;
+constexpr uint8_t kGripperServo = 1;
+constexpr uint8_t kGripperMinAngle = 25;
+constexpr uint8_t kGripperMaxAngle = 155;
+constexpr uint8_t kGripperOpenAngle = 150;
+constexpr uint8_t kGripperCloseAngle = 35;
+constexpr uint8_t kGripperWriteRepeats = 3;
+constexpr uint32_t kGripperWriteIntervalMs = 35;
 
 constexpr uint32_t kHeartbeatMs = 1000;
 constexpr uint32_t kMotionRefreshMs = 50;
@@ -20,6 +26,7 @@ constexpr uint8_t kDiagMotors = 4;
 constexpr uint32_t kDiagRunMs = 1000;
 constexpr uint32_t kDiagStopMs = 300;
 constexpr uint32_t kWifiConnectTimeoutMs = 20000;
+constexpr uint32_t kScreenSleepMs = 120000;
 
 constexpr const char* kWifiSsid = WIFI_SSID;
 constexpr const char* kWifiPassword = WIFI_PASSWORD;
@@ -48,6 +55,7 @@ bool motion_command_active = false;
 uint8_t diag_motor_index = 0;
 bool diag_motor_phase_run = true;
 uint32_t diag_phase_started_at = 0;
+uint32_t last_activity_at = 0;
 
 const uint32_t kStepDurationMs[kSequenceSteps] = {
     1000,  // FORWARD 50%
@@ -58,6 +66,10 @@ const uint32_t kStepDurationMs[kSequenceSteps] = {
     500,   // GRIPPER CLOSE
     0      // IDLE (terminal step)
 };
+
+void noteActivity() {
+  last_activity_at = millis();
+}
 
 void stopMotors() {
   roverc.setSpeed(0, 0, 0);
@@ -82,6 +94,29 @@ void stopAllMotionOutputs() {
   roverc.setAllPulse(0, 0, 0, 0);
 }
 
+void enterDeepSleep() {
+  Serial.println("Entering deep sleep...");
+  if (rover_ready) {
+    stopAllMotionOutputs();
+  }
+  M5.Display.setBrightness(0);
+  M5.Display.sleep();
+  server.stop();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(10);
+
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_37, 0);              // BtnA
+  esp_sleep_enable_ext1_wakeup(1ULL << 39, ESP_EXT1_WAKEUP_ALL_LOW);  // BtnB
+  esp_deep_sleep_start();
+}
+
+void checkSleepTimeout() {
+  if (millis() - last_activity_at >= kScreenSleepMs) {
+    enterDeepSleep();
+  }
+}
+
 void refreshMotionCommand() {
   if (!rover_ready || !motion_command_active) {
     return;
@@ -104,9 +139,33 @@ void setWifiStatus(const char* status) {
   Serial.println(wifi_status);
 }
 
-void applyStep(uint8_t step) {
+bool recoverRover(const bool force_reinit = false) {
+  if (rover_ready && !force_reinit) {
+    return true;
+  }
+  rover_ready = roverc.begin();
+  Serial.printf("Rover reinit: %s\n", rover_ready ? "OK" : "FAILED");
   if (!rover_ready) {
     setAction("ROVER I2C FAIL");
+    return false;
+  }
+  return true;
+}
+
+void setGripperAngle(const uint8_t angle) {
+  const uint8_t safe_angle = constrain(angle, kGripperMinAngle, kGripperMaxAngle);
+  for (uint8_t i = 0; i < kGripperWriteRepeats; ++i) {
+    roverc.setServoAngle(kGripperServo, safe_angle);
+    delay(kGripperWriteIntervalMs);
+  }
+  Serial.printf("Gripper servo=%u angle=%u sent x%u\n",
+                static_cast<unsigned>(kGripperServo),
+                static_cast<unsigned>(safe_angle),
+                static_cast<unsigned>(kGripperWriteRepeats));
+}
+
+void applyStep(uint8_t step) {
+  if (!recoverRover()) {
     sequence_running = false;
     return;
   }
@@ -131,13 +190,13 @@ void applyStep(uint8_t step) {
       setAction("GRIPPER OPEN");
       disableMotionCommand();
       stopMotors();
-      roverc.setServoAngle(kGripperServo, kGripperOpenAngle);
+      setGripperAngle(kGripperOpenAngle);
       break;
     case 5:
       setAction("GRIPPER CLOSE");
       disableMotionCommand();
       stopMotors();
-      roverc.setServoAngle(kGripperServo, kGripperCloseAngle);
+      setGripperAngle(kGripperCloseAngle);
       break;
     default:
       setAction("IDLE");
@@ -176,27 +235,25 @@ void commandStop(const char* action = "STOP") {
 }
 
 void commandGripperOpen() {
-  if (!rover_ready) {
-    setAction("ROVER I2C FAIL");
+  if (!recoverRover(true)) {
     return;
   }
   sequence_running = false;
   diag_running = false;
   setAction("GRIPPER OPEN");
   stopAllMotionOutputs();
-  roverc.setServoAngle(kGripperServo, kGripperOpenAngle);
+  setGripperAngle(kGripperOpenAngle);
 }
 
 void commandGripperClose() {
-  if (!rover_ready) {
-    setAction("ROVER I2C FAIL");
+  if (!recoverRover(true)) {
     return;
   }
   sequence_running = false;
   diag_running = false;
   setAction("GRIPPER CLOSE");
   stopAllMotionOutputs();
-  roverc.setServoAngle(kGripperServo, kGripperCloseAngle);
+  setGripperAngle(kGripperCloseAngle);
 }
 
 void startSequence() {
@@ -291,6 +348,14 @@ void updateSequence() {
   applyStep(current_step);
 }
 
+uint16_t actionColor() {
+  if (std::strstr(current_action, "EMERGENCY")) return RED;
+  if (std::strstr(current_action, "FAIL")) return RED;
+  if (std::strstr(current_action, "STOP")) return 0xFDA0;  // orange
+  if (std::strstr(current_action, "IDLE")) return GREEN;
+  return CYAN;
+}
+
 void drawStatus() {
   const int battery = M5.Power.getBatteryLevel();
   if (std::strcmp(last_drawn_action, current_action) == 0 &&
@@ -299,18 +364,53 @@ void drawStatus() {
     return;
   }
 
+  const int w = M5.Display.width();
+  const int h = M5.Display.height();
+  const int kRowH = h / 3;
+  constexpr uint16_t kRow1Bg = 0x18C3;
+  constexpr uint16_t kRow2Bg = 0x1082;
+  constexpr uint16_t kRow3Bg = 0x0000;
+
   M5.Display.fillScreen(BLACK);
-  M5.Display.setTextColor(WHITE, BLACK);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(6, 16);
-  M5.Display.printf("Action:");
-  M5.Display.setCursor(6, 44);
-  M5.Display.printf("%s", current_action);
-  M5.Display.setCursor(6, 92);
-  M5.Display.printf("Battery: %d%%", battery);
+  M5.Display.fillRect(0, 0, w, kRowH, kRow1Bg);
+  M5.Display.fillRect(0, kRowH, w, kRowH, kRow2Bg);
+  M5.Display.fillRect(0, kRowH * 2, w, h - (kRowH * 2), kRow3Bg);
+  M5.Display.drawFastHLine(0, kRowH, w, 0x4208);
+  M5.Display.drawFastHLine(0, kRowH * 2, w, 0x4208);
+
+  M5.Display.setTextDatum(textdatum_t::top_center);
   M5.Display.setTextSize(1);
-  M5.Display.setCursor(6, 118);
-  M5.Display.printf("%s", wifi_status);
+  M5.Display.setTextColor(WHITE, kRow1Bg);
+  M5.Display.drawString("BATTERY", w / 2, 2);
+  M5.Display.setTextColor(WHITE, kRow2Bg);
+  M5.Display.drawString("IP ADDRESS", w / 2, kRowH + 2);
+  M5.Display.setTextColor(actionColor(), kRow3Bg);
+  M5.Display.drawString("OPERATION", w / 2, kRowH * 2 + 2);
+
+  M5.Display.setTextDatum(textdatum_t::middle_center);
+  M5.Display.setTextSize(3);
+  M5.Display.setTextColor(WHITE, kRow1Bg);
+  M5.Display.drawString(String(battery) + "%", w / 2, kRowH / 2 + 8);
+
+  const char* wifi_text = wifi_status;
+  if (const char* p = std::strstr(wifi_status, ": ")) {
+    wifi_text = p + 2;
+  }
+  String wifi_short = wifi_text;
+  if (wifi_short.length() > 18) {
+    wifi_short = wifi_short.substring(0, 18);
+  }
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(WHITE, kRow2Bg);
+  M5.Display.drawString(wifi_short, w / 2, kRowH + (kRowH / 2) + 8);
+
+  String op_short = current_action;
+  if (op_short.length() > 14) {
+    op_short = op_short.substring(0, 14);
+  }
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(actionColor(), kRow3Bg);
+  M5.Display.drawString(op_short, w / 2, kRowH * 2 + (kRowH / 2) + 8);
 
   std::snprintf(last_drawn_action, sizeof(last_drawn_action), "%s", current_action);
   std::snprintf(last_drawn_wifi, sizeof(last_drawn_wifi), "%s", wifi_status);
@@ -342,34 +442,102 @@ void handleRoot() {
 <html>
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
   <title>Rover Control</title>
   <style>
     body{font-family:Arial,sans-serif;margin:16px;background:#101820;color:#f2f2f2}
     h1{margin:0 0 12px}
-    .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;max-width:420px}
+    .layout{display:flex;flex-direction:column;align-items:flex-start;gap:12px}
+    .controls{width:100%;max-width:420px}
+    .joy-wrap{
+      width:100%;max-width:420px;display:flex;justify-content:center
+    }
+    canvas{touch-action:none}
+    .speed{max-width:420px;margin:0 0 12px;display:flex;align-items:center;gap:10px}
+    .speed input{flex:1;accent-color:#2d7dd2}
+    .speed span{min-width:42px;text-align:right;font-size:18px;font-weight:bold}
+    .btns{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;max-width:420px}
     button{padding:14px;border:0;border-radius:8px;background:#2d7dd2;color:#fff;font-size:16px}
     button.stop{background:#d7263d}
     .wide{grid-column:1/4}
+    @media (max-width: 900px){
+      .controls{max-width:none}
+    }
   </style>
 </head>
 <body>
   <h1>Rover Web Control</h1>
-  <div class="grid">
-    <button onclick="cmd('forward')">Forward</button>
-    <button onclick="cmd('left')">Left</button>
-    <button onclick="cmd('right')">Right</button>
-    <button onclick="cmd('backward')">Backward</button>
-    <button onclick="cmd('rotate_l')">Rotate L</button>
-    <button onclick="cmd('rotate_r')">Rotate R</button>
-    <button class="wide stop" onclick="cmd('stop')">STOP</button>
-    <button onclick="cmd('open')">Gripper Open</button>
-    <button onclick="cmd('close')">Gripper Close</button>
-    <button onclick="cmd('demo')">Run Demo</button>
-    <button class="stop" onclick="cmd('emergency')">Emergency</button>
+  <div class="layout">
+    <div class="joy-wrap"><canvas id="joy" width="200" height="200"></canvas></div>
+    <div class="controls">
+      <div class="speed">
+        <span>&#x1F3CE;</span>
+        <input type="range" id="spd" min="10" max="100" step="10" value="80">
+        <span id="spdVal">80%</span>
+      </div>
+      <div class="btns">
+        <button onclick="rot(-1)">Rotate L</button>
+        <button class="stop" onclick="cmd('stop')">STOP</button>
+        <button onclick="rot(1)">Rotate R</button>
+        <button onclick="cmd('open')">Gripper Open</button>
+        <button onclick="cmd('close')">Gripper Close</button>
+        <button onclick="cmd('demo')">Run Demo</button>
+        <button class="wide stop" onclick="cmd('emergency')">Emergency</button>
+      </div>
+    </div>
   </div>
   <script>
-    function cmd(act){ fetch('/cmd?act='+encodeURIComponent(act)).catch(()=>{}); }
+    function cmd(a){fetch('/cmd?act='+encodeURIComponent(a)).catch(function(){});}
+    var sl=document.getElementById('spd'),sv=document.getElementById('spdVal');
+    var spd=80;
+    sl.oninput=function(){spd=+this.value;sv.textContent=spd+'%';};
+    function rot(dir){
+      var z=Math.round(spd*dir);
+      fetch('/cmd?act=move&x=0&y=0&z='+z).catch(function(){});
+    }
+    var C=document.getElementById('joy'),ctx=C.getContext('2d');
+    var W=200,cx=100,cy=100,bR=80,kR=25,dz=10;
+    var kx=cx,ky=cy,act=false,tmr=null;
+    function draw(){
+      ctx.clearRect(0,0,W,W);
+      ctx.beginPath();ctx.arc(cx,cy,bR,0,6.283);
+      ctx.fillStyle='#1a2a3a';ctx.fill();
+      ctx.strokeStyle='#2d7dd2';ctx.lineWidth=2;ctx.stroke();
+      ctx.strokeStyle='#223344';ctx.lineWidth=1;
+      ctx.beginPath();ctx.moveTo(cx-bR,cy);ctx.lineTo(cx+bR,cy);ctx.stroke();
+      ctx.beginPath();ctx.moveTo(cx,cy-bR);ctx.lineTo(cx,cy+bR);ctx.stroke();
+      ctx.beginPath();ctx.arc(kx,ky,kR,0,6.283);
+      ctx.fillStyle=act?'#4a9de8':'#2d7dd2';ctx.fill();
+    }
+    function sendJoy(){
+      var dx=kx-cx,dy=-(ky-cy);
+      if(Math.abs(dx)<dz)dx=0;if(Math.abs(dy)<dz)dy=0;
+      var x=Math.round(Math.max(-100,Math.min(100,dx/bR*100))*spd/100);
+      var y=Math.round(Math.max(-100,Math.min(100,dy/bR*100))*spd/100);
+      fetch('/cmd?act=move&x='+x+'&y='+y).catch(function(){});
+    }
+    function onDown(e){
+      act=true;C.setPointerCapture(e.pointerId);
+      onMv(e);sendJoy();tmr=setInterval(sendJoy,100);
+    }
+    function onMv(e){
+      if(!act)return;
+      var r=C.getBoundingClientRect();
+      var dx=e.clientX-r.left-cx,dy=e.clientY-r.top-cy;
+      var d=Math.sqrt(dx*dx+dy*dy);
+      if(d>bR){dx=dx/d*bR;dy=dy/d*bR;}
+      kx=cx+dx;ky=cy+dy;draw();
+    }
+    function onUp(){
+      act=false;kx=cx;ky=cy;draw();
+      if(tmr){clearInterval(tmr);tmr=null;}
+      cmd('stop');
+    }
+    C.addEventListener('pointerdown',onDown);
+    C.addEventListener('pointermove',onMv);
+    C.addEventListener('pointerup',onUp);
+    C.addEventListener('pointercancel',onUp);
+    draw();
   </script>
 </body>
 </html>
@@ -384,6 +552,7 @@ void handleCmd() {
   }
 
   const String act = server.arg("act");
+  noteActivity();
   if (act == "forward") {
     commandMove("WEB FORWARD", 0, kWebSpeedPercent, 0);
   } else if (act == "backward") {
@@ -396,6 +565,14 @@ void handleCmd() {
     commandMove("WEB ROTATE L", 0, 0, -kWebSpeedPercent);
   } else if (act == "rotate_r") {
     commandMove("WEB ROTATE R", 0, 0, kWebSpeedPercent);
+  } else if (act == "move") {
+    int x = server.hasArg("x") ? server.arg("x").toInt() : 0;
+    int y = server.hasArg("y") ? server.arg("y").toInt() : 0;
+    int z = server.hasArg("z") ? server.arg("z").toInt() : 0;
+    x = constrain(x, -100, 100);
+    y = constrain(y, -100, 100);
+    z = constrain(z, -100, 100);
+    commandMove("WEB JOYSTICK", static_cast<int8_t>(x), static_cast<int8_t>(y), static_cast<int8_t>(z));
   } else if (act == "stop") {
     commandStop("WEB STOP");
   } else if (act == "open") {
@@ -433,6 +610,8 @@ void setupWifiAndServer() {
   std::snprintf(line, sizeof(line), "WiFi: %s", WiFi.localIP().toString().c_str());
   setWifiStatus(line);
 
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+
   server.on("/", handleRoot);
   server.on("/cmd", handleCmd);
   server.begin();
@@ -451,11 +630,13 @@ void setup() {
   Serial.printf("Rover begin: %s\n", rover_ready ? "OK" : "FAILED");
   if (rover_ready) {
     stopAllMotionOutputs();
-    roverc.setServoAngle(kGripperServo, kGripperCloseAngle);
+    setGripperAngle(kGripperCloseAngle);
   }
   setupWifiAndServer();
 
   M5.Display.setRotation(3);
+  M5.Display.setBrightness(80);
+  last_activity_at = millis();
   setAction(rover_ready ? "IDLE" : "ROVER I2C FAIL");
   drawStatus();
 }
@@ -465,11 +646,13 @@ void loop() {
 
   if (M5.BtnB.wasPressed() || M5.BtnB.wasClicked()) {
     Serial.println("BtnB pressed");
+    noteActivity();
     emergencyStop();
   }
 
   if (M5.BtnA.wasPressed() || M5.BtnA.wasClicked()) {
     Serial.println("BtnA pressed");
+    noteActivity();
     startSequence();
   }
 
@@ -479,6 +662,7 @@ void loop() {
   if (web_server_started) {
     server.handleClient();
   }
+  checkSleepTimeout();
   drawStatus();
   emitHeartbeat();
 }

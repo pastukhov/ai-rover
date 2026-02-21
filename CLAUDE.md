@@ -4,53 +4,67 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Embedded robotics project for an M5Stack RoverC Pro (K036-B) mecanum-wheel robot controlled by an M5StickC Plus (ESP32-PICO-D4). The repo contains hardware documentation and four Arduino/PlatformIO C++ libraries.
+Embedded robotics project for an M5Stack RoverC Pro (K036-B) mecanum-wheel robot controlled by an M5StickC Plus (ESP32-PICO-D4). The firmware provides button-triggered demo sequences, emergency stop, on-screen status, and Wi-Fi web control.
 
 ## Build & Flash Commands
 
-There is no root-level build system. Each library is an independent Arduino library. Firmware projects use PlatformIO:
-
 ```bash
+# Prerequisites: create Wi-Fi credentials from template
+cp include/secrets.h.example include/secrets.h   # then edit with your SSID/password
+
 # Build firmware
 pio run
 
 # Flash to device
 pio run --target upload
 
-# Serial monitor
-pio device monitor
+# Serial monitor (115200 baud)
+pio device monitor --baud 115200
 
-# Arduino CLI alternative (for library examples)
-arduino-cli compile --fqbn esp32:esp32:m5stick-c-plus <path-to-ino>
-arduino-cli upload --fqbn esp32:esp32:m5stick-c-plus -p /dev/ttyUSB0 <path-to-ino>
-
-# Desktop SDL2 simulation (M5GFX/M5Unified — no hardware needed)
-cd libraries/M5GFX/examples/PlatformIO_SDL && pio run -e native
-cd libraries/M5Unified/examples/PlatformIO_SDL && pio run -e native
+# Clean build artifacts
+pio run -t clean
 ```
 
-No automated tests or linters are configured. Examples in `examples/` directories serve as functional validation.
+No automated tests or linters. Validation is: `pio run` compiles → flash → manual smoke test on hardware.
 
 ## Repository Structure
 
 ```
-docs/                           # Hardware specs (RoverC Pro, M5StickC Plus, UnitV camera)
+src/main.cpp                    # All firmware logic (single-file)
+platformio.ini                  # PlatformIO config (m5stick-c, M5Unified + M5-RoverC deps)
+include/secrets.h               # Wi-Fi credentials (git-ignored, create from .example)
+docs/                           # Hardware specs in Russian (RoverC Pro, M5StickC Plus, UnitV)
   plans/                        # Firmware design plans
-libraries/
-  M5-RoverC/                    # I2C motor/servo control (2 source files + examples)
-  M5Unified/                    # Device abstraction for 60+ M5Stack boards
-  M5GFX/                        # Graphics/display library (built on LovyanGFX)
-  M5-ProductExampleCodes/       # Reference examples (discontinued, read-only)
+libraries/                      # Local reference copies of M5 libraries (git-ignored, read-only)
+AGENTS.md                       # Subagent roles and execution order for multi-agent workflows
 todo.md                         # Current firmware task spec
 ```
 
-Each library has its own `CLAUDE.md` with detailed architecture — read those before modifying library code.
+Each library in `libraries/` has its own `CLAUDE.md` with detailed architecture — read those before modifying library code.
+
+## Firmware Architecture (`src/main.cpp`)
+
+Single-file, state-machine-driven firmware. Everything runs in a non-blocking `loop()` — no `delay()` in runtime paths.
+
+**Core state machines:**
+- **Demo sequence** — 7-step timed sequence (forward/stop/backward/stop/gripper open/close/idle), triggered by BtnA. Durations in `kStepDurationMs[]`, steps applied by `applyStep()`.
+- **Motor diagnostic** — per-motor test cycle (run/stop each motor sequentially), triggered via web command.
+- **Motion refresh** — active motion commands are re-sent every 50ms (`kMotionRefreshMs`) to keep RoverC alive.
+
+**Controls:**
+- BtnA → start demo sequence
+- BtnB → emergency stop (motors off immediately, all state machines halted)
+- Wi-Fi web UI → movement, gripper, demo, emergency (HTTP on port 80, `GET /cmd?act=...`)
+
+**Display:** dirty-flag rendering — only redraws when action, battery, or Wi-Fi status changes.
+
+**Safety invariant:** `emergencyStop()` is reachable every `loop()` iteration. BtnB check is first in `loop()`.
 
 ## Hardware Target
 
-**Controller:** M5StickC Plus — ESP32, 1.14" TFT (ST7789v2, 135x240), MPU6886 IMU, 120 mAh battery, buttons A/B + power
-**Robot base:** RoverC Pro — STM32F030, 4x N20 mecanum motors (L9110S driver), 2 servo ports, gripper, 16340 battery (700 mAh)
-**Communication:** I2C at address `0x38`, pins SDA=0/SCL=26, 100-400 kHz
+**Controller:** M5StickC Plus — ESP32, 1.14" TFT (135x240), MPU6886 IMU, buttons A/B + power
+**Robot base:** RoverC Pro — STM32F030, 4x N20 mecanum motors, 2 servo ports, gripper
+**Communication:** I2C at address `0x38`, pins SDA=0/SCL=26
 
 ### I2C Register Map (0x38)
 
@@ -67,7 +81,7 @@ Each library has its own `CLAUDE.md` with detailed architecture — read those b
 ## Library Stack
 
 ```
-User firmware
+User firmware (src/main.cpp)
   → M5_RoverC        (I2C motor/servo commands)
   → M5Unified        (hardware abstraction: display, buttons, IMU, power, speaker)
     → M5GFX           (graphics engine, board auto-detection)
@@ -83,6 +97,7 @@ User firmware
 - **Board-specific behavior** uses `switch` on `board_t` enum, not `#ifdef` per device
 - **Chip-specific compilation** uses `#if defined(CONFIG_IDF_TARGET_ESP32)`, not device-level ifdefs
 - **Config pattern:** nested `config_t` structs for initialization
+- **Non-blocking loop:** use `millis()` timers, never `delay()` in runtime paths
 - **C++ standard:** C++14 minimum
-- **Naming:** classes `PascalCase` (with prefixes like `Panel_`, `Bus_`), methods `camelCase`, enums `snake_case_t`, namespaces `m5gfx`/`lgfx`
+- **Naming:** classes `PascalCase`, methods `camelCase`, constants `kPascalCase`, enums `snake_case_t`
 - **Docs are in Russian** — hardware descriptions in `docs/` use Russian language
