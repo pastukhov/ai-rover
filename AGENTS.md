@@ -3,12 +3,14 @@
 ## Project Structure & Module Organization
 - `src/` — firmware source for the M5StickC Plus controller (`main.cpp`).
 - `platformio.ini` — PlatformIO environment and dependency configuration.
+- `include/secrets.h` — local Wi-Fi/OpenRouter credentials (create from `include/secrets.h.example`, do not commit).
 - `docs/` — hardware notes and planning artifacts (for example `docs/plans/`).
 - `libraries/` — local reference copies of upstream M5 libraries and examples. Treat these primarily as documentation/reference unless a task explicitly requires editing them.
 - `todo.md` — current task specification used for implementation scope.
 - Build artifacts (`.pio/`, `.pio-core/`) are generated and should not be treated as source.
 
 ## Build, Test, and Development Commands
+- `cp include/secrets.h.example include/secrets.h` — create local credentials header before build/flash.
 - `pio run` — build firmware and validate compilation.
 - `pio run --target upload` — flash firmware to connected device.
 - `pio device monitor --baud 115200` — open serial monitor.
@@ -27,7 +29,9 @@
 - Minimum validation for changes:
   1. `pio run` passes.
   2. Flash succeeds (`pio run --target upload`).
-  3. Manual smoke test on hardware (buttons, movement, display, battery text, emergency stop).
+  3. Manual smoke test on hardware (buttons, movement, display, battery text, emergency stop, sleep/wake behavior).
+  4. Web control smoke test (`/`, `/cmd?act=...`) over local Wi-Fi.
+  5. AI chat smoke test (`/chat?msg=...`) when `OPENROUTER_API_KEY` is configured.
 - If adding scripts/tools, include a small reproducible smoke-check command in `docs/`.
 
 ## Observability & Logs
@@ -38,6 +42,7 @@
   - `Syslog enabled: 192.168.11.2:514`
   - `Web server started: http://<ip>/`
   - `AI tools: READY (ESP_OK)`
+  - `AI response: Rover AI online.`
   - periodic `HB ... action=... battery=...`
 
 ## Subagent Roles
