@@ -1,16 +1,14 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `src/` — firmware source for the M5StickC Plus controller (`main.cpp`).
+- `src/` — firmware source for the M5StickC Plus controller (`main_idf.c`, `CMakeLists.txt`).
 - `platformio.ini` — PlatformIO environment and dependency configuration.
-- `include/secrets.h` — local Wi-Fi/OpenRouter credentials (create from `include/secrets.h.example`, do not commit).
 - `docs/` — hardware notes and planning artifacts (for example `docs/plans/`).
 - `libraries/` — local reference copies of upstream M5 libraries and examples. Treat these primarily as documentation/reference unless a task explicitly requires editing them.
 - `todo.md` — current task specification used for implementation scope.
 - Build artifacts (`.pio/`, `.pio-core/`) are generated and should not be treated as source.
 
 ## Build, Test, and Development Commands
-- `cp include/secrets.h.example include/secrets.h` — create local credentials header before build/flash.
 - `pio run` — build firmware and validate compilation.
 - `pio run --target upload` — flash firmware to connected device.
 - `pio device monitor --baud 115200` — open serial monitor.
@@ -18,39 +16,31 @@
 - `rg "<pattern>" -n` — fast code/text search across the repository.
 
 ## Coding Style & Naming Conventions
-- Language: C++14 (PlatformIO + Arduino framework).
+- Language: C (PlatformIO + ESP-IDF framework).
 - Indentation: 2 spaces; keep line endings LF.
-- Naming: `camelCase` for functions/variables, `PascalCase` for types, `kPrefix` for constants (for example `kHeartbeatMs`).
-- Prefer concise, state-driven logic in `loop()` and avoid blocking delays for runtime control paths.
-- Use only documented library APIs (especially `M5_RoverC` and `M5Unified`) and avoid direct low-level I2C register writes in app code.
+- Naming: `snake_case` for functions/variables, `UPPER_SNAKE_CASE` for compile-time constants.
+- Prefer non-blocking FreeRTOS task loops; keep watchdog-safe delays (`vTaskDelay`) explicit.
+- Use documented ESP-IDF APIs and avoid raw register access in app code unless task explicitly requires it.
 
 ## Testing Guidelines
 - No formal automated test suite is configured.
 - Minimum validation for changes:
   1. `pio run` passes.
   2. Flash succeeds (`pio run --target upload`).
-  3. Manual smoke test on hardware (buttons, movement, display, battery text, emergency stop, sleep/wake behavior).
-  4. Web control smoke test (`/`, `/cmd?act=...`) over local Wi-Fi.
-  5. AI chat smoke test (`/chat?msg=...`) when `OPENROUTER_API_KEY` is configured.
+  3. Serial boot log smoke test (`ESP_LOG*` output visible after reset).
+  4. Manual hardware smoke test for any enabled peripherals touched by the change.
 - If adding scripts/tools, include a small reproducible smoke-check command in `docs/`.
 
 ## Observability & Logs
-- Rover firmware logs are shipped via syslog and visible in Loki.
-- Current syslog target reported by firmware boot logs: `192.168.11.2:514`.
-- Preferred Loki selector for rover logs: `{host="ai-rover", application="firmware", job="syslog"}`.
-- Typical healthy boot sequence in logs includes lines similar to:
-  - `Syslog enabled: 192.168.11.2:514`
-  - `Web server started: http://<ip>/`
-  - `AI tools: READY (ESP_OK)`
-  - `AI response: Rover AI online.`
-  - periodic `HB ... action=... battery=...`
+- Primary runtime logs are `ESP_LOG*` messages from ESP-IDF over UART.
+- Loki/syslog integration is optional and should be explicitly re-enabled only after ESP-IDF porting of logging stack.
 
 ## Subagent Roles
 - `planner` — converts `todo.md` into explicit implementation steps, acceptance criteria, and command checklist (`pio run`, upload, monitor).
-- `doc-reader` — reads all relevant `CLAUDE.md` and library headers/examples to extract allowed APIs before code changes.
-- `firmware-implementer` — edits `src/main.cpp` and `platformio.ini`, implements behavior, keeps loop non-blocking, and preserves emergency stop responsiveness.
+- `doc-reader` — reads relevant `CLAUDE.md` and ESP-IDF docs/examples to extract allowed APIs before code changes.
+- `firmware-implementer` — edits `src/main_idf.c`, `src/CMakeLists.txt`, `platformio.ini`, and sdkconfig defaults; keeps runtime loops non-blocking.
 - `build-runner` — runs build/flash/monitor workflow and reports exact failures with actionable fix direction.
-- `spec-reviewer` — checks that runtime behavior matches task spec exactly (button mapping, timing sequence, display requirements).
+- `spec-reviewer` — checks that runtime behavior matches task spec exactly for current ESP-IDF implementation scope.
 - `hardware-diagnostics` — focuses on on-device diagnostics (per-motor checks, serial telemetry, power/connectivity assumptions) when behavior differs from expected.
 
 ### Recommended Execution Order
@@ -64,7 +54,7 @@
 ### Handoff Rules
 - Every implementer handoff must include changed files, why changes were made, and what API constraints were respected.
 - Every build handoff must include command used, pass/fail, and key error/output lines.
-- Never skip `doc-reader` when touching motor/servo/display/power logic.
+- Never skip `doc-reader` when touching motor/servo/display/power/network logic.
 
 ## Commit & Pull Request Guidelines
 - Commit messages: imperative mood with optional scope, e.g. `firmware: reduce display flicker`.
