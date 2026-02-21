@@ -48,22 +48,43 @@ Single-file, state-machine-driven firmware. Everything runs in a non-blocking `l
 
 **Core state machines:**
 - **Demo sequence** — 7-step timed sequence (forward/stop/backward/stop/gripper open/close/idle), triggered by BtnA. Durations in `kStepDurationMs[]`, steps applied by `applyStep()`.
-- **Motor diagnostic** — per-motor test cycle (run/stop each motor sequentially), triggered via web command.
+- **Motor diagnostic** — per-motor test cycle (run/stop each motor sequentially via `setAllPulse`), triggered by `startMotorDiagnostic()`. Currently not wired to any web endpoint.
 - **Motion refresh** — active motion commands are re-sent every 50ms (`kMotionRefreshMs`) to keep RoverC alive.
 
 **Controls:**
 - BtnA → start demo sequence
 - BtnB → emergency stop (motors off immediately, all state machines halted)
-- Wi-Fi web UI → movement, gripper, demo, emergency (HTTP on port 80, `GET /cmd?act=...`)
+- Wi-Fi web UI → movement, gripper, demo, emergency (HTTP on port 80)
 
-**Display:** dirty-flag rendering — only redraws when action, battery, or Wi-Fi status changes.
+**Display:** rotation 3 (landscape 240×135), dirty-flag rendering — only redraws when action, battery, or Wi-Fi status changes. Three-row layout: battery % / IP address / current operation (color-coded by state).
+
+**Deep sleep & power management:**
+- Auto-sleep after `kScreenSleepMs` (120s) of inactivity
+- `noteActivity()` resets the timer on button presses and web commands
+- Wakeup: ext0 on BtnA (G37, LOW), ext1 on BtnB (G39, ALL_LOW)
+- WiFi power saving: `WIFI_PS_MIN_MODEM`
+- On sleep: motors off, display off, WiFi disconnected
 
 **Safety invariant:** `emergencyStop()` is reachable every `loop()` iteration. BtnB check is first in `loop()`.
 
+### Web API (`GET /cmd?act=...`)
+
+| `act` value | Parameters | Action |
+|-------------|------------|--------|
+| `move` | `x`, `y`, `z` (each -100..100) | Joystick control (strafe, forward/back, rotation) |
+| `forward`, `backward`, `left`, `right` | — | Fixed-direction at `kWebSpeedPercent` |
+| `rotate_l`, `rotate_r` | — | Rotate in place |
+| `stop` | — | Stop all motors |
+| `open`, `close` | — | Gripper servo control |
+| `demo` | — | Start demo sequence |
+| `emergency` | — | Emergency stop |
+
+Web UI (`/`) serves an inline HTML page with a canvas joystick, speed slider (10-100%), rotation buttons, and gripper/demo/emergency controls. Joystick sends `move` commands at 100ms intervals while held.
+
 ## Hardware Target
 
-**Controller:** M5StickC Plus — ESP32, 1.14" TFT (135x240), MPU6886 IMU, buttons A/B + power
-**Robot base:** RoverC Pro — STM32F030, 4x N20 mecanum motors, 2 servo ports, gripper
+**Controller:** M5StickC Plus — ESP32, 1.14" TFT (135×240 native, used landscape 240×135), MPU6886 IMU, buttons A/B + power
+**Robot base:** RoverC Pro — STM32F030, 4x N20 mecanum motors, 2 servo ports, gripper on Servo1
 **Communication:** I2C at address `0x38`, pins SDA=0/SCL=26
 
 ### I2C Register Map (0x38)
@@ -98,6 +119,7 @@ User firmware (src/main.cpp)
 - **Chip-specific compilation** uses `#if defined(CONFIG_IDF_TARGET_ESP32)`, not device-level ifdefs
 - **Config pattern:** nested `config_t` structs for initialization
 - **Non-blocking loop:** use `millis()` timers, never `delay()` in runtime paths
+- **Gripper servo writes** are repeated `kGripperWriteRepeats` times with short delays — this is intentional (I2C reliability workaround for STM32 servo controller)
 - **C++ standard:** C++14 minimum
 - **Naming:** classes `PascalCase`, methods `camelCase`, constants `kPascalCase`, enums `snake_case_t`
 - **Docs are in Russian** — hardware descriptions in `docs/` use Russian language
