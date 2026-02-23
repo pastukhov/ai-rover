@@ -67,9 +67,13 @@ static const uart_port_t kVisionUart = UART_NUM_1;
 static const gpio_num_t kVisionTxPin = GPIO_NUM_32;
 static const gpio_num_t kVisionRxPin = GPIO_NUM_33;
 static const int kVisionBaud = 115200;
-static const int kVisionRxBuf = 1024;
+static const int kVisionRxBuf = 2048;
 static const int kVisionTimeoutMs = 7000;
 static const int kVisionPingTimeoutMs = 500;
+static const int kVisionCaptureTimeoutMs = 12000;
+static const int kCaptureMaxJpegBytes = 40960;   // 40KB K210 limit
+static const int kCaptureDefaultQuality = 75;
+static const int kCaptureChunkSize = 2048;
 #define VISION_RESP_MAX 512
 
 // ── Rover FSM ──
@@ -568,6 +572,92 @@ static esp_err_t vision_cmd_timeout(const char *cmd, const char *args_json,
 static esp_err_t vision_cmd(const char *cmd, const char *args_json,
                             char *resp, size_t resp_size) {
   return vision_cmd_timeout(cmd, args_json, resp, resp_size, kVisionTimeoutMs);
+}
+
+static esp_err_t vision_capture(int quality, uint8_t **jpeg_out, size_t *jpeg_size_out) {
+  *jpeg_out = NULL;
+  *jpeg_size_out = 0;
+
+  uint32_t rid = ++s_vision_req_id;
+  char req[128];
+  int n = snprintf(req, sizeof(req),
+                   "{\"cmd\":\"CAPTURE\",\"req_id\":\"%" PRIu32 "\",\"args\":{\"quality\":%d}}\n",
+                   rid, quality);
+  if (n >= (int)sizeof(req)) return ESP_ERR_NO_MEM;
+
+  uart_flush_input(kVisionUart);
+  int sent = uart_write_bytes(kVisionUart, req, n);
+  if (sent != n) return ESP_FAIL;
+
+  TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(kVisionCaptureTimeoutMs);
+
+  // Phase 1: read JSON header until \n
+  char hdr[256];
+  int pos = 0;
+  while (pos < (int)sizeof(hdr) - 1) {
+    TickType_t now = xTaskGetTickCount();
+    if ((int32_t)(deadline - now) <= 0) return ESP_ERR_TIMEOUT;
+    uint8_t byte;
+    int rd = uart_read_bytes(kVisionUart, &byte, 1, deadline - now);
+    if (rd <= 0) return ESP_ERR_TIMEOUT;
+    if (byte == '\n') break;
+    if (byte >= 0x20) hdr[pos++] = (char)byte;
+  }
+  hdr[pos] = '\0';
+  if (pos == 0) return ESP_ERR_TIMEOUT;
+
+  // Parse JSON header
+  cJSON *root = cJSON_Parse(hdr);
+  if (!root) return ESP_ERR_INVALID_RESPONSE;
+
+  cJSON *ok_field = cJSON_GetObjectItem(root, "ok");
+  if (!cJSON_IsTrue(ok_field)) {
+    cJSON_Delete(root);
+    return ESP_FAIL;
+  }
+
+  cJSON *result = cJSON_GetObjectItem(root, "result");
+  cJSON *size_field = result ? cJSON_GetObjectItem(result, "size") : NULL;
+  if (!size_field || !cJSON_IsNumber(size_field)) {
+    cJSON_Delete(root);
+    return ESP_ERR_INVALID_RESPONSE;
+  }
+  int jpeg_size = size_field->valueint;
+  cJSON_Delete(root);
+
+  if (jpeg_size <= 0 || jpeg_size > kCaptureMaxJpegBytes) return ESP_ERR_INVALID_RESPONSE;
+
+  // Phase 2: read binary JPEG data
+  uint8_t *buf = (uint8_t *)malloc(jpeg_size);
+  if (!buf) return ESP_ERR_NO_MEM;
+
+  int total = 0;
+  while (total < jpeg_size) {
+    TickType_t now = xTaskGetTickCount();
+    if ((int32_t)(deadline - now) <= 0) { free(buf); return ESP_ERR_TIMEOUT; }
+    int want = jpeg_size - total;
+    if (want > kCaptureChunkSize) want = kCaptureChunkSize;
+    int rd = uart_read_bytes(kVisionUart, buf + total, want, deadline - now);
+    if (rd <= 0) { free(buf); return ESP_ERR_TIMEOUT; }
+    total += rd;
+  }
+
+  rover_log_field_t fields[] = {
+    rover_log_field_str("cmd", "CAPTURE"),
+    rover_log_field_int("jpeg_bytes", jpeg_size),
+  };
+  rover_log_record_t rec = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "vision_capture_ok",
+    .fields = fields,
+    .field_count = sizeof(fields) / sizeof(fields[0]),
+  };
+  rover_log(&rec);
+
+  *jpeg_out = buf;
+  *jpeg_size_out = (size_t)jpeg_size;
+  return ESP_OK;
 }
 
 static esp_err_t rover_init_i2c(void) {
@@ -1131,7 +1221,10 @@ static esp_err_t handle_root(httpd_req_t *req) {
       "<button onclick=\"vscan('OBJECTS')\">Objects</button>"
       "<button onclick=\"vscan('WHO')\">Who</button>"
       "<button onclick=\"vscan('PING')\">Ping</button>"
+      "<button onclick=\"vcapture()\">Capture</button>"
       "</div>"
+      "<img id='camImg' style='display:none;max-width:100%;margin-top:8px;"
+      "border-radius:8px;border:1px solid #334155' />"
       "<pre id='visionOut' style='margin-top:8px;max-height:200px;overflow:auto'>--</pre>"
       "</div>"
       /* Chat */
@@ -1219,6 +1312,17 @@ static esp_err_t handle_root(httpd_req_t *req) {
       "try{document.getElementById('visionOut').textContent=JSON.stringify(JSON.parse(t),null,2);}"
       "catch(_){document.getElementById('visionOut').textContent=t;}}"
       "catch(e){document.getElementById('visionOut').textContent='error: '+e;}}"
+      "async function vcapture(){"
+      "const vo=document.getElementById('visionOut'),img=document.getElementById('camImg');"
+      "vo.textContent='capturing...';"
+      "try{const r=await fetch('/vision?cmd=CAPTURE&quality=75');"
+      "if(!r.ok){vo.textContent='capture failed: '+r.status;return;}"
+      "const b=await r.blob();"
+      "const u=URL.createObjectURL(b);"
+      "img.onload=function(){URL.revokeObjectURL(u);};"
+      "img.src=u;img.style.display='block';"
+      "vo.textContent='captured '+b.size+' bytes';}"
+      "catch(e){vo.textContent='error: '+e;}}"
       "drawJ();setInterval(refresh,1500);refresh();"
       "</script></body></html>";
   httpd_resp_set_type(req, "text/html");
@@ -1251,31 +1355,59 @@ static esp_err_t handle_status(httpd_req_t *req) {
 }
 
 static esp_err_t handle_vision(httpd_req_t *req) {
-  char query[64] = {0};
+  char query[96] = {0};
   char cmd[16] = "SCAN";
   char mode[16] = "RELIABLE";
+  char quality_str[8] = "";
   if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
     (void)httpd_query_key_value(query, "cmd", cmd, sizeof(cmd));
     (void)httpd_query_key_value(query, "mode", mode, sizeof(mode));
+    (void)httpd_query_key_value(query, "quality", quality_str, sizeof(quality_str));
   }
 
   // Whitelist commands
   if (strcmp(cmd, "SCAN") != 0 && strcmp(cmd, "OBJECTS") != 0 &&
       strcmp(cmd, "WHO") != 0 && strcmp(cmd, "PING") != 0 &&
-      strcmp(cmd, "INFO") != 0) {
+      strcmp(cmd, "INFO") != 0 && strcmp(cmd, "CAPTURE") != 0) {
     httpd_resp_set_status(req, "400 Bad Request");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":false,\"error\":\"invalid cmd\"}", HTTPD_RESP_USE_STRLEN);
   }
 
+  mark_activity();
+
+  // CAPTURE: binary JPEG response
+  if (strcmp(cmd, "CAPTURE") == 0) {
+    int quality = kCaptureDefaultQuality;
+    if (quality_str[0] != '\0') {
+      int q = atoi(quality_str);
+      if (q >= 10 && q <= 95) quality = q;
+    }
+    uint8_t *jpeg = NULL;
+    size_t jpeg_size = 0;
+    xSemaphoreTake(s_vision_mutex, portMAX_DELAY);
+    esp_err_t err = vision_capture(quality, &jpeg, &jpeg_size);
+    xSemaphoreGive(s_vision_mutex);
+    if (err != ESP_OK) {
+      s_vision_available = false;
+      httpd_resp_set_status(req, "504 Gateway Timeout");
+      httpd_resp_set_type(req, "application/json");
+      return httpd_resp_send(req, "{\"ok\":false,\"error\":\"capture failed\"}", HTTPD_RESP_USE_STRLEN);
+    }
+    s_vision_available = true;
+    httpd_resp_set_type(req, "image/jpeg");
+    esp_err_t send_err = httpd_resp_send(req, (const char *)jpeg, jpeg_size);
+    free(jpeg);
+    return send_err;
+  }
+
+  // Text commands
   char args_json[64];
   if (strcmp(cmd, "PING") == 0 || strcmp(cmd, "INFO") == 0) {
     strlcpy(args_json, "{}", sizeof(args_json));
   } else {
     snprintf(args_json, sizeof(args_json), "{\"mode\":\"%s\",\"frames\":1}", mode);
   }
-
-  mark_activity();
 
   char resp[VISION_RESP_MAX];
   xSemaphoreTake(s_vision_mutex, portMAX_DELAY);
