@@ -11,13 +11,16 @@
 - Аварийный стоп по кнопке `BtnB`.
 - Веб‑интерфейс управления по Wi‑Fi.
 - Статус на экране: текущее действие, батарея, Wi‑Fi.
+- Структурные JSON‑логи в UART и syslog через единый логгер `rover_log(...)`.
 
 ### Структура
-- `src/main.cpp` — основная логика прошивки.
+- `src/main_idf.cpp` — основная логика прошивки (ESP‑IDF / PlatformIO).
+- `src/logger_json.{h,cpp}` — единый structured logger (UART + syslog mirror).
 - `platformio.ini` — конфигурация PlatformIO.
 - `include/secrets.h` — локальные Wi‑Fi креды (не коммитится).
 - `include/secrets.h.example` — шаблон секретов.
 - `docs/` — документация и планы.
+- `docs/logging-conventions.md` — схема и naming для JSON‑логов.
 
 ### Быстрый старт
 1. Создайте `include/secrets.h` по шаблону `include/secrets.h.example`.
@@ -46,6 +49,12 @@ http://<IP_ровера>/
 - Не коммитьте `include/secrets.h`.
 - Проверьте `.gitignore` перед пушем.
 
+### Логи и наблюдаемость
+- Все runtime-логи приложения идут в JSON через `rover_log(...)`.
+- Один и тот же JSON пишется в UART и зеркалится в syslog.
+- Бизнес-логика не должна вызывать `send_syslog()` напрямую.
+- Формат и naming событий: `docs/logging-conventions.md`.
+
 ---
 
 ## English
@@ -59,13 +68,16 @@ Firmware project for **M5StickC Plus** (controller) and **RoverC Pro** (motor/gr
 - Emergency stop on `BtnB`.
 - Wi‑Fi web control page.
 - On-screen status: current action, battery, Wi‑Fi.
+- Structured JSON logs to UART and syslog via the unified `rover_log(...)` logger.
 
 ### Structure
-- `src/main.cpp` — main firmware logic.
+- `src/main_idf.cpp` — main firmware logic (ESP-IDF / PlatformIO).
+- `src/logger_json.{h,cpp}` — unified structured logger (UART + syslog mirror).
 - `platformio.ini` — PlatformIO configuration.
 - `include/secrets.h` — local Wi‑Fi credentials (ignored by git).
 - `include/secrets.h.example` — credentials template.
 - `docs/` — hardware notes and plans.
+- `docs/logging-conventions.md` — JSON log schema and event naming rules.
 
 ### Quick Start
 1. Create `include/secrets.h` from `include/secrets.h.example`.
@@ -94,3 +106,8 @@ http://<rover_ip>/
 - Do not commit `include/secrets.h`.
 - Verify `.gitignore` before pushing.
 
+### Logs & Observability
+- All application runtime logs are emitted as JSON through `rover_log(...)`.
+- The same JSON line is written to UART and mirrored to syslog.
+- Business logic should not call `send_syslog()` directly.
+- Log schema and event naming conventions are documented in `docs/logging-conventions.md`.

@@ -11,6 +11,7 @@
 #include <strings.h>
 
 #include "M5Unified.h"
+#include "logger_json.h"
 #include "secrets.h"
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
@@ -32,6 +33,8 @@
 #include "openrouter.h"
 
 static const char *TAG = "ai-rover-idf";
+
+static size_t json_escape_copy(char *dst, size_t dst_size, const char *src);
 
 static const char *kSyslogHost = "192.168.11.2";
 static const int kSyslogPort = 514;
@@ -66,6 +69,7 @@ static const gpio_num_t kVisionRxPin = GPIO_NUM_33;
 static const int kVisionBaud = 115200;
 static const int kVisionRxBuf = 1024;
 static const int kVisionTimeoutMs = 7000;
+static const int kVisionPingTimeoutMs = 500;
 #define VISION_RESP_MAX 512
 
 // ── Rover FSM ──
@@ -110,6 +114,7 @@ static rover_state_t s_rover_state = STATE_IDLE;
 
 // Forward declaration — implemented after syslog helpers
 static void transition_to(rover_state_t new_state);
+static void send_syslog(const char *message);
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num;
@@ -161,7 +166,18 @@ static void wifi_event_handler(void *arg,
     if (s_retry_num < kWifiMaxRetry) {
       esp_wifi_connect();
       s_retry_num++;
-      ESP_LOGW(TAG, "WiFi reconnect attempt %d/%d", s_retry_num, kWifiMaxRetry);
+      rover_log_field_t fields[] = {
+        rover_log_field_int("retry", s_retry_num),
+        rover_log_field_int("max_retry", kWifiMaxRetry),
+      };
+      rover_log_record_t rec = {
+        .level = ESP_LOG_WARN,
+        .component = TAG,
+        .event = "wifi_reconnect_attempt",
+        .fields = fields,
+        .field_count = sizeof(fields) / sizeof(fields[0]),
+      };
+      rover_log(&rec);
     } else {
       xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
     }
@@ -214,14 +230,37 @@ static esp_err_t wifi_connect_blocking(void) {
   vEventGroupDelete(s_wifi_event_group);
 
   if (bits & WIFI_CONNECTED_BIT) {
-    ESP_LOGI(TAG, "WiFi connected to %s", WIFI_SSID);
+    rover_log_field_t fields[] = { rover_log_field_str("ssid", WIFI_SSID) };
+    rover_log_record_t rec = {
+      .level = ESP_LOG_INFO,
+      .component = TAG,
+      .event = "wifi_connected",
+      .fields = fields,
+      .field_count = sizeof(fields) / sizeof(fields[0]),
+    };
+    rover_log(&rec);
     return ESP_OK;
   }
   if ((bits & WIFI_FAIL_BIT) == 0) {
-    ESP_LOGE(TAG, "WiFi connect timed out");
+    rover_log_record_t rec = {
+      .level = ESP_LOG_ERROR,
+      .component = TAG,
+      .event = "wifi_connect_timeout",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec);
     return ESP_ERR_TIMEOUT;
   }
-  ESP_LOGE(TAG, "WiFi connect failed after %d attempts", kWifiMaxRetry);
+  rover_log_field_t fields[] = { rover_log_field_int("max_retry", kWifiMaxRetry) };
+  rover_log_record_t rec = {
+    .level = ESP_LOG_ERROR,
+    .component = TAG,
+    .event = "wifi_connect_failed",
+    .fields = fields,
+    .field_count = sizeof(fields) / sizeof(fields[0]),
+  };
+  rover_log(&rec);
   return ESP_FAIL;
 }
 
@@ -277,12 +316,28 @@ static int open_syslog_socket(void) {
 
   int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
   if (sock < 0) {
-    ESP_LOGE(TAG, "Failed to create socket: errno=%d", errno);
+    rover_log_field_t fields[] = { rover_log_field_int("errno", errno) };
+    rover_log_record_t rec = {
+      .level = ESP_LOG_ERROR,
+      .component = TAG,
+      .event = "syslog_socket_create_failed",
+      .fields = fields,
+      .field_count = sizeof(fields) / sizeof(fields[0]),
+    };
+    rover_log(&rec);
     return -1;
   }
 
   if (connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) != 0) {
-    ESP_LOGE(TAG, "Failed to connect syslog socket: errno=%d", errno);
+    rover_log_field_t fields[] = { rover_log_field_int("errno", errno) };
+    rover_log_record_t rec = {
+      .level = ESP_LOG_ERROR,
+      .component = TAG,
+      .event = "syslog_socket_connect_failed",
+      .fields = fields,
+      .field_count = sizeof(fields) / sizeof(fields[0]),
+    };
+    rover_log(&rec);
     close(sock);
     return -1;
   }
@@ -372,6 +427,11 @@ static void send_syslog(const char *message) {
   xQueueSend(s_syslog_queue, buf, 0);
 }
 
+static void rover_log_syslog_sink(const char *json_line, void *ctx) {
+  (void)ctx;
+  send_syslog(json_line);
+}
+
 static void read_power_metrics(int16_t *vbus_mv, int32_t *bat_pct) {
   if (s_power_mutex != NULL) xSemaphoreTake(s_power_mutex, portMAX_DELAY);
   if (vbus_mv != NULL) *vbus_mv = M5.Power.getVBUSVoltage();
@@ -385,10 +445,18 @@ static void transition_to(rover_state_t new_state) {
   const char *from = state_name(s_rover_state);
   const char *to = state_name(new_state);
   s_rover_state = new_state;
-  ESP_LOGI(TAG, "FSM %s -> %s", from, to);
-  char buf[64];
-  snprintf(buf, sizeof(buf), "FSM %s -> %s", from, to);
-  send_syslog(buf);
+  rover_log_field_t fields[] = {
+    rover_log_field_str("from", from),
+    rover_log_field_str("to", to),
+  };
+  rover_log_record_t rec = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "fsm_transition",
+    .fields = fields,
+    .field_count = sizeof(fields) / sizeof(fields[0]),
+  };
+  rover_log(&rec);
 }
 
 static esp_err_t rover_write(uint8_t reg, const uint8_t *data, size_t len) {
@@ -451,8 +519,8 @@ static esp_err_t vision_uart_init(void) {
                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 }
 
-static esp_err_t vision_cmd(const char *cmd, const char *args_json,
-                            char *resp, size_t resp_size) {
+static esp_err_t vision_cmd_timeout(const char *cmd, const char *args_json,
+                                    char *resp, size_t resp_size, int timeout_ms) {
   uint32_t rid = ++s_vision_req_id;
   char req[256];
   int n = snprintf(req, sizeof(req),
@@ -467,7 +535,7 @@ static esp_err_t vision_cmd(const char *cmd, const char *args_json,
 
   // Read until \n or timeout
   int pos = 0;
-  TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(kVisionTimeoutMs);
+  TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
   while (pos < (int)resp_size - 1) {
     TickType_t now = xTaskGetTickCount();
     if ((int32_t)(deadline - now) <= 0) return ESP_ERR_TIMEOUT;
@@ -482,10 +550,24 @@ static esp_err_t vision_cmd(const char *cmd, const char *args_json,
   resp[pos] = '\0';
   if (pos == 0) return ESP_ERR_TIMEOUT;
 
-  char log_buf[80];
-  snprintf(log_buf, sizeof(log_buf), "VISION %s -> %d bytes", cmd, pos);
-  send_syslog(log_buf);
+  rover_log_field_t fields[] = {
+    rover_log_field_str("cmd", cmd),
+    rover_log_field_int("resp_bytes", pos),
+  };
+  rover_log_record_t rec = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "vision_uart_response",
+    .fields = fields,
+    .field_count = sizeof(fields) / sizeof(fields[0]),
+  };
+  rover_log(&rec);
   return ESP_OK;
+}
+
+static esp_err_t vision_cmd(const char *cmd, const char *args_json,
+                            char *resp, size_t resp_size) {
+  return vision_cmd_timeout(cmd, args_json, resp, resp_size, kVisionTimeoutMs);
 }
 
 static esp_err_t rover_init_i2c(void) {
@@ -560,7 +642,14 @@ static void apply_action(const char *action, bool from_web) {
 
 static void enter_deep_sleep(void) {
   rover_emergency_stop();
-  send_syslog("enter deep sleep");
+  rover_log_record_t rec = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "power_deep_sleep_enter",
+    .fields = NULL,
+    .field_count = 0,
+  };
+  rover_log(&rec);
   draw_boot_status("sleeping...", "press A/B wake");
   vTaskDelay(pdMS_TO_TICKS(200));
 
@@ -588,21 +677,54 @@ static void enter_deep_sleep(void) {
   (void)rtc_gpio_pullup_en(kBtnAPin);
   esp_err_t ext0_err = esp_sleep_enable_ext0_wakeup(kBtnAPin, 0);
   if (ext0_err != ESP_OK) {
-    ESP_LOGE(TAG, "ext0 wake setup failed for BtnA: %s", esp_err_to_name(ext0_err));
+    rover_log_field_t fields[] = {
+      rover_log_field_str("button", "A"),
+      rover_log_field_str("err", esp_err_to_name(ext0_err)),
+    };
+    rover_log_record_t rec = {
+      .level = ESP_LOG_ERROR,
+      .component = TAG,
+      .event = "wake_ext0_setup_failed",
+      .fields = fields,
+      .field_count = sizeof(fields) / sizeof(fields[0]),
+    };
+    rover_log(&rec);
   }
 
   // BtnB (G39) — ext1, wakeup on ALL_LOW (active-low button)
   (void)rtc_gpio_pullup_en(kBtnBPin);
   esp_err_t ext1_err = esp_sleep_enable_ext1_wakeup(1ULL << kBtnBPin, ESP_EXT1_WAKEUP_ALL_LOW);
   if (ext1_err != ESP_OK) {
-    ESP_LOGE(TAG, "ext1 wake setup failed for BtnB: %s", esp_err_to_name(ext1_err));
+    rover_log_field_t fields[] = {
+      rover_log_field_str("button", "B"),
+      rover_log_field_str("err", esp_err_to_name(ext1_err)),
+    };
+    rover_log_record_t rec = {
+      .level = ESP_LOG_ERROR,
+      .component = TAG,
+      .event = "wake_ext1_setup_failed",
+      .fields = fields,
+      .field_count = sizeof(fields) / sizeof(fields[0]),
+    };
+    rover_log(&rec);
   }
 
   // Keep RTC peripherals powered in deep sleep so RTC GPIO wake logic and pull config
   // remain reliable on StickC Plus button lines (regression observed after Arduino->IDF port).
   esp_err_t rtc_pd_err = esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
   if (rtc_pd_err != ESP_OK) {
-    ESP_LOGE(TAG, "RTC_PERIPH pd config failed: %s", esp_err_to_name(rtc_pd_err));
+    rover_log_field_t fields[] = {
+      rover_log_field_str("domain", "RTC_PERIPH"),
+      rover_log_field_str("err", esp_err_to_name(rtc_pd_err)),
+    };
+    rover_log_record_t rec = {
+      .level = ESP_LOG_ERROR,
+      .component = TAG,
+      .event = "power_domain_config_failed",
+      .fields = fields,
+      .field_count = sizeof(fields) / sizeof(fields[0]),
+    };
+    rover_log(&rec);
   }
 
   esp_deep_sleep_start();
@@ -638,9 +760,20 @@ static char *cb_move(const char *fn, const char *arguments, void *ud) {
   duration_ms = clamp_int(duration_ms, 100, 5000);
 
   mark_activity();
-  char log_buf[64];
-  snprintf(log_buf, sizeof(log_buf), "TOOL move x=%d y=%d z=%d ms=%d", x, y, z, duration_ms);
-  send_syslog(log_buf);
+  rover_log_field_t fields[] = {
+    rover_log_field_int("x", x),
+    rover_log_field_int("y", y),
+    rover_log_field_int("z", z),
+    rover_log_field_int("duration_ms", duration_ms),
+  };
+  rover_log_record_t rec = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "tool_move",
+    .fields = fields,
+    .field_count = sizeof(fields) / sizeof(fields[0]),
+  };
+  rover_log(&rec);
 
   TickType_t end = xTaskGetTickCount() + pdMS_TO_TICKS(duration_ms);
   while (xTaskGetTickCount() < end) {
@@ -685,10 +818,20 @@ static char *cb_turn(const char *fn, const char *arguments, void *ud) {
   uint32_t timeout_ms = (uint32_t)clamp_int((int)(target * 100.0f), 2000, 12000);
 
   mark_activity();
-  char log_buf[64];
-  snprintf(log_buf, sizeof(log_buf), "TOOL turn %s %.0f deg spd=%d",
-           turn_left ? "left" : "right", (double)target, spd);
-  send_syslog(log_buf);
+  rover_log_field_t fields[] = {
+    rover_log_field_str("direction", turn_left ? "left" : "right"),
+    rover_log_field_int("angle_deg", (int)target),
+    rover_log_field_int("speed_pct", spd),
+    rover_log_field_int("timeout_ms", timeout_ms),
+  };
+  rover_log_record_t rec = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "tool_turn",
+    .fields = fields,
+    .field_count = sizeof(fields) / sizeof(fields[0]),
+  };
+  rover_log(&rec);
 
   float turned = 0.0f;
   TickType_t start_tick = xTaskGetTickCount();
@@ -730,7 +873,14 @@ static char *cb_stop(const char *fn, const char *arguments, void *ud) {
   set_motion(0, 0, 0, false);
   s_web_motion_deadline = 0;
   xSemaphoreGive(s_state_mutex);
-  send_syslog("TOOL stop");
+  rover_log_record_t rec = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "tool_stop",
+    .fields = NULL,
+    .field_count = 0,
+  };
+  rover_log(&rec);
   return make_tool_response("ok", "stop"); // openrouter_client frees this
 }
 
@@ -741,7 +891,14 @@ static char *cb_gripper_open(const char *fn, const char *arguments, void *ud) {
   s_gripper_open = true;
   xSemaphoreGive(s_state_mutex);
   (void)rover_set_servo_angle(kGripperServo, kGripperOpenAngle);
-  send_syslog("TOOL gripper_open");
+  rover_log_record_t rec = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "tool_gripper_open",
+    .fields = NULL,
+    .field_count = 0,
+  };
+  rover_log(&rec);
   return make_tool_response("ok", "gripper_open"); // openrouter_client frees this
 }
 
@@ -752,7 +909,14 @@ static char *cb_gripper_close(const char *fn, const char *arguments, void *ud) {
   s_gripper_open = false;
   xSemaphoreGive(s_state_mutex);
   (void)rover_set_servo_angle(kGripperServo, kGripperCloseAngle);
-  send_syslog("TOOL gripper_close");
+  rover_log_record_t rec = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "tool_gripper_close",
+    .fields = NULL,
+    .field_count = 0,
+  };
+  rover_log(&rec);
   return make_tool_response("ok", "gripper_close"); // openrouter_client frees this
 }
 
@@ -791,7 +955,14 @@ static char *cb_vision_scan(const char *fn, const char *arguments, void *ud) {
   snprintf(cmd_args, sizeof(cmd_args), "{\"mode\":\"%s\",\"frames\":1}", mode);
 
   mark_activity();
-  send_syslog("TOOL vision_scan");
+  rover_log_record_t rec = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "tool_vision_scan",
+    .fields = NULL,
+    .field_count = 0,
+  };
+  rover_log(&rec);
 
   char resp[VISION_RESP_MAX];
   xSemaphoreTake(s_vision_mutex, portMAX_DELAY);
@@ -811,7 +982,14 @@ static char *cb_vision_scan(const char *fn, const char *arguments, void *ud) {
   if (ok_field && cJSON_IsTrue(ok_field) && result) {
     if (!s_vision_available) {
       s_vision_available = true;
-      send_syslog("Vision camera online (via AI)");
+      rover_log_record_t rec = {
+        .level = ESP_LOG_INFO,
+        .component = TAG,
+        .event = "vision_available_via_ai",
+        .fields = NULL,
+        .field_count = 0,
+      };
+      rover_log(&rec);
     }
     char *result_str = cJSON_PrintUnformatted(result);
     cJSON_Delete(json);
@@ -835,7 +1013,14 @@ static void chat_worker_task(void *arg) {
 
     esp_err_t err = ESP_FAIL;
     response[0] = '\0';
-    send_syslog("WEB chat: start");
+    rover_log_record_t start_rec = {
+      .level = ESP_LOG_INFO,
+      .component = TAG,
+      .event = "web_chat_start",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&start_rec);
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     transition_to(STATE_AI_THINKING);
@@ -876,7 +1061,17 @@ static void chat_worker_task(void *arg) {
     }
     xSemaphoreGive(s_chat_mutex);
 
-    send_syslog(err == ESP_OK ? "WEB chat: ok" : "WEB chat: failed");
+    rover_log_field_t fields[] = {
+      rover_log_field_str("status", err == ESP_OK ? "ok" : "failed"),
+    };
+    rover_log_record_t done_rec = {
+      .level = ESP_LOG_INFO,
+      .component = TAG,
+      .event = "web_chat_done",
+      .fields = fields,
+      .field_count = sizeof(fields) / sizeof(fields[0]),
+    };
+    rover_log(&done_rec);
   }
 }
 
@@ -1096,8 +1291,22 @@ static esp_err_t handle_vision(httpd_req_t *req) {
   // Update availability on any successful response
   if (!s_vision_available && strstr(resp, "\"ok\":true") != NULL) {
     s_vision_available = true;
-    send_syslog("Vision camera online");
-    ESP_LOGI(TAG, "Vision camera now available");
+    rover_log_record_t rec1 = {
+      .level = ESP_LOG_INFO,
+      .component = TAG,
+      .event = "vision_status_online",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec1);
+    rover_log_record_t rec2 = {
+      .level = ESP_LOG_INFO,
+      .component = TAG,
+      .event = "vision_available",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec2);
   }
   return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
 }
@@ -1266,7 +1475,17 @@ static void start_mdns(void) {
   };
   ESP_ERROR_CHECK(mdns_service_add("AI Rover", "_http", "_tcp", 80, txt,
                                    sizeof(txt) / sizeof(txt[0])));
-  ESP_LOGI(TAG, "mDNS started: ai-rover.local");
+  rover_log_field_t mdns_fields[] = {
+    rover_log_field_str("host", "ai-rover.local"),
+  };
+  rover_log_record_t mdns_rec = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "mdns_started",
+    .fields = mdns_fields,
+    .field_count = sizeof(mdns_fields) / sizeof(mdns_fields[0]),
+  };
+  rover_log(&mdns_rec);
 }
 
 static void start_web_server(void) {
@@ -1337,8 +1556,22 @@ static void init_ai(void) {
       "Respond naturally in the user's language. Be brief.";
   s_ai = openrouter_create(&cfg);
   if (s_ai == NULL) {
-    ESP_LOGE(TAG, "OpenRouter init failed");
-    send_syslog("AI init failed");
+    rover_log_record_t rec1 = {
+      .level = ESP_LOG_ERROR,
+      .component = TAG,
+      .event = "ai_openrouter_init_failed",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec1);
+    rover_log_record_t rec2 = {
+      .level = ESP_LOG_ERROR,
+      .component = TAG,
+      .event = "ai_init_failed",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec2);
     return;
   }
 
@@ -1347,10 +1580,34 @@ static void init_ai(void) {
     reg_err = openrouter_register_simple_function(s_ai, &kTools[i]);
   }
   if (reg_err != ESP_OK) {
-    ESP_LOGE(TAG, "Tool registration failed: %s", esp_err_to_name(reg_err));
-    send_syslog("AI tools FAILED");
+    rover_log_field_t fields[] = {
+      rover_log_field_str("err", esp_err_to_name(reg_err)),
+    };
+    rover_log_record_t rec1 = {
+      .level = ESP_LOG_ERROR,
+      .component = TAG,
+      .event = "ai_tool_registration_failed",
+      .fields = fields,
+      .field_count = sizeof(fields) / sizeof(fields[0]),
+    };
+    rover_log(&rec1);
+    rover_log_record_t rec2 = {
+      .level = ESP_LOG_ERROR,
+      .component = TAG,
+      .event = "ai_tools_failed",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec2);
   } else {
-    send_syslog("AI init OK + tools");
+    rover_log_record_t rec = {
+      .level = ESP_LOG_INFO,
+      .component = TAG,
+      .event = "ai_init_ok",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec);
   }
 }
 
@@ -1549,7 +1806,14 @@ static void wifi_reconnect_task(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(15000));
     if (s_wifi_connected) continue;
 
-    ESP_LOGI(TAG, "Attempting WiFi reconnect...");
+    rover_log_record_t rec = {
+      .level = ESP_LOG_INFO,
+      .component = TAG,
+      .event = "wifi_reconnect_start",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec);
     s_retry_num = 0;
     s_wifi_event_group = xEventGroupCreate();
     if (s_wifi_event_group == NULL) continue;
@@ -1583,9 +1847,76 @@ static void wifi_reconnect_task(void *arg) {
       xSemaphoreTake(s_state_mutex, portMAX_DELAY);
       transition_to(STATE_IDLE);
       xSemaphoreGive(s_state_mutex);
-      ESP_LOGI(TAG, "WiFi reconnected, services restored");
-      send_syslog("WiFi reconnected");
+      rover_log_record_t rec = {
+        .level = ESP_LOG_INFO,
+        .component = TAG,
+      .event = "wifi_reconnect_services_restored",
+        .fields = NULL,
+        .field_count = 0,
+      };
+      rover_log(&rec);
     }
+  }
+}
+
+static void vision_ping_task(void *arg) {
+  (void)arg;
+
+  TickType_t last_vision_ping = 0;
+  while (1) {
+    TickType_t now = xTaskGetTickCount();
+    if ((now - last_vision_ping) >= kVisionPingPeriod) {
+      last_vision_ping = now;
+      if (xSemaphoreTake(s_vision_mutex, 0) == pdTRUE) {
+        char ping_resp[128];
+        esp_err_t ping_err =
+            vision_cmd_timeout("PING", "{}", ping_resp, sizeof(ping_resp), kVisionPingTimeoutMs);
+        xSemaphoreGive(s_vision_mutex);
+        bool was = s_vision_available;
+        s_vision_available = (ping_err == ESP_OK && strstr(ping_resp, "\"ok\":true") != NULL);
+        if (ping_err != ESP_OK) {
+          rover_log_field_t fields[] = {
+            rover_log_field_str("result", "error"),
+            rover_log_field_str("err", esp_err_to_name(ping_err)),
+          };
+          rover_log_record_t rec = {
+            .level = ESP_LOG_DEBUG,
+            .component = TAG,
+            .event = "vision_ping",
+            .fields = fields,
+            .field_count = sizeof(fields) / sizeof(fields[0]),
+          };
+          rover_log(&rec);
+        } else if (!s_vision_available) {
+          rover_log_field_t fields[] = {
+            rover_log_field_str("result", "bad_response"),
+            rover_log_field_int("resp_len", (int64_t)strlen(ping_resp)),
+          };
+          rover_log_record_t rec = {
+            .level = ESP_LOG_DEBUG,
+            .component = TAG,
+            .event = "vision_ping",
+            .fields = fields,
+            .field_count = sizeof(fields) / sizeof(fields[0]),
+          };
+          rover_log(&rec);
+        }
+        if (s_vision_available != was) {
+          rover_log_field_t fields[] = {
+            rover_log_field_str("status", s_vision_available ? "online" : "offline"),
+          };
+          rover_log_record_t rec = {
+            .level = ESP_LOG_INFO,
+            .component = TAG,
+            .event = "vision_status",
+            .fields = fields,
+            .field_count = sizeof(fields) / sizeof(fields[0]),
+          };
+          rover_log(&rec);
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
@@ -1599,7 +1930,6 @@ static void main_loop_task(void *arg) {
   bool prev_btn_a = false;
   bool prev_btn_b = false;
   TickType_t last_hb = 0;
-  TickType_t last_vision_ping = 0;
 
   while (1) {
     esp_task_wdt_reset();
@@ -1618,7 +1948,19 @@ static void main_loop_task(void *arg) {
       s_gripper_open = !s_gripper_open;
       (void)rover_set_servo_angle(kGripperServo, s_gripper_open ? kGripperOpenAngle : kGripperCloseAngle);
       transition_to(STATE_IDLE);
-      send_syslog(s_gripper_open ? "BtnB: STOP + GRIPPER OPEN" : "BtnB: STOP + GRIPPER CLOSE");
+      rover_log_field_t fields[] = {
+        rover_log_field_str("button", "B"),
+        rover_log_field_str("action", "stop"),
+        rover_log_field_str("gripper", s_gripper_open ? "open" : "close"),
+      };
+      rover_log_record_t rec = {
+        .level = ESP_LOG_INFO,
+        .component = TAG,
+        .event = "button_action",
+        .fields = fields,
+        .field_count = sizeof(fields) / sizeof(fields[0]),
+      };
+      rover_log(&rec);
     }
 
     if (btn_a && btn_b) {
@@ -1640,11 +1982,33 @@ static void main_loop_task(void *arg) {
     if (!btn_a && prev_btn_a && s_web_motion_deadline == 0) {
       mark_activity();
       set_motion(0, 0, 0, false);
-      send_syslog("BtnA: STOP");
+      rover_log_field_t fields[] = {
+        rover_log_field_str("button", "A"),
+        rover_log_field_str("action", "stop"),
+      };
+      rover_log_record_t rec = {
+        .level = ESP_LOG_INFO,
+        .component = TAG,
+        .event = "button_action",
+        .fields = fields,
+        .field_count = sizeof(fields) / sizeof(fields[0]),
+      };
+      rover_log(&rec);
     }
     if (btn_a && !prev_btn_a) {
       mark_activity();
-      send_syslog("BtnA: ACTIVE");
+      rover_log_field_t fields[] = {
+        rover_log_field_str("button", "A"),
+        rover_log_field_str("action", "active"),
+      };
+      rover_log_record_t rec = {
+        .level = ESP_LOG_INFO,
+        .component = TAG,
+        .event = "button_action",
+        .fields = fields,
+        .field_count = sizeof(fields) / sizeof(fields[0]),
+      };
+      rover_log(&rec);
     }
 
     apply_motion();
@@ -1659,40 +2023,34 @@ static void main_loop_task(void *arg) {
 
     TickType_t now = xTaskGetTickCount();
     if ((now - last_hb) >= kHeartbeatPeriod) {
-      char hb[256];
       int32_t bat_pct = -1;
       read_power_metrics(NULL, &bat_pct);
       xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-      snprintf(hb,
-               sizeof(hb),
-               "{\"event\":\"heartbeat\",\"state\":\"%s\",\"moving\":%d,"
-               "\"x\":%d,\"y\":%d,\"z\":%d,\"gripper\":\"%s\",\"bat_pct\":%d}",
-               state_name(s_rover_state),
-               s_motion_active ? 1 : 0,
-               s_motion_x,
-               s_motion_y,
-               s_motion_z,
-               s_gripper_open ? "open" : "close",
-               (int)bat_pct);
+      const char *state = state_name(s_rover_state);
+      int moving = s_motion_active ? 1 : 0;
+      int x = s_motion_x;
+      int y = s_motion_y;
+      int z = s_motion_z;
+      const char *gripper = s_gripper_open ? "open" : "close";
       xSemaphoreGive(s_state_mutex);
-      send_syslog(hb);
+      rover_log_field_t fields[] = {
+        rover_log_field_str("state", state),
+        rover_log_field_int("moving", moving),
+        rover_log_field_int("x", x),
+        rover_log_field_int("y", y),
+        rover_log_field_int("z", z),
+        rover_log_field_str("gripper", gripper),
+        rover_log_field_int("bat_pct", (int)bat_pct),
+      };
+      rover_log_record_t rec = {
+        .level = ESP_LOG_INFO,
+        .component = TAG,
+        .event = "heartbeat",
+        .fields = fields,
+        .field_count = sizeof(fields) / sizeof(fields[0]),
+      };
+      rover_log(&rec);
       last_hb = now;
-    }
-
-    // Periodic vision camera ping
-    if ((now - last_vision_ping) >= kVisionPingPeriod) {
-      last_vision_ping = now;
-      if (xSemaphoreTake(s_vision_mutex, 0) == pdTRUE) {
-        char ping_resp[128];
-        esp_err_t ping_err = vision_cmd("PING", "{}", ping_resp, sizeof(ping_resp));
-        xSemaphoreGive(s_vision_mutex);
-        bool was = s_vision_available;
-        s_vision_available = (ping_err == ESP_OK && strstr(ping_resp, "\"ok\":true") != NULL);
-        if (s_vision_available != was) {
-          ESP_LOGI(TAG, "Vision camera %s", s_vision_available ? "online" : "offline");
-          send_syslog(s_vision_available ? "Vision online" : "Vision offline");
-        }
-      }
     }
 
     prev_btn_a = btn_a;
@@ -1742,36 +2100,96 @@ extern "C" void app_main(void) {
       s_ai_mutex == NULL || s_chat_mutex == NULL ||
       s_vision_mutex == NULL ||
       s_chat_queue == NULL || s_syslog_queue == NULL) {
-    ESP_LOGE(TAG, "Mutex/queue allocation failed");
+    rover_log_record_t rec = {
+      .level = ESP_LOG_ERROR,
+      .component = TAG,
+      .event = "init_alloc_failed_mutex_or_queue",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec);
     esp_restart();
   }
+
+  // Unified logger: mirror JSON UART logs to syslog queue.
+  rover_log_set_sink(rover_log_syslog_sink, NULL);
 
   auto m5cfg = M5.config();
   M5.begin(m5cfg);
   M5.Display.setRotation(1);
   draw_boot_status("booting...", "");
   esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
-  ESP_LOGI(TAG, "Wakeup cause: %s (%d)", wakeup_cause_name(wake), (int)wake);
+  rover_log_field_t wake_fields[] = {
+    rover_log_field_str("cause", wakeup_cause_name(wake)),
+    rover_log_field_int("cause_id", (int)wake),
+  };
+  rover_log_record_t wake_rec = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "wakeup_cause",
+    .fields = wake_fields,
+    .field_count = sizeof(wake_fields) / sizeof(wake_fields[0]),
+  };
+  rover_log(&wake_rec);
 
   ESP_ERROR_CHECK(rover_init_i2c());
 
+  bool vision_uart_ready = false;
+
   // Init vision UART (UnitV-M12 on Grove G32/G33)
   if (vision_uart_init() == ESP_OK) {
-    ESP_LOGI(TAG, "Vision UART initialized (TX=G33, RX=G32)");
+    vision_uart_ready = true;
+    rover_log_field_t fields[] = {
+      rover_log_field_int("tx_pin", 33),
+      rover_log_field_int("rx_pin", 32),
+    };
+    rover_log_record_t rec = {
+      .level = ESP_LOG_INFO,
+      .component = TAG,
+      .event = "vision_uart_initialized",
+      .fields = fields,
+      .field_count = sizeof(fields) / sizeof(fields[0]),
+    };
+    rover_log(&rec);
     // Give camera time to be ready, then ping
     vTaskDelay(pdMS_TO_TICKS(500));
     char ping_resp[128];
     xSemaphoreTake(s_vision_mutex, portMAX_DELAY);
-    esp_err_t ping_err = vision_cmd("PING", "{}", ping_resp, sizeof(ping_resp));
+    esp_err_t ping_err =
+        vision_cmd_timeout("PING", "{}", ping_resp, sizeof(ping_resp), kVisionPingTimeoutMs);
     xSemaphoreGive(s_vision_mutex);
     if (ping_err == ESP_OK && strstr(ping_resp, "\"ok\":true") != NULL) {
       s_vision_available = true;
-      ESP_LOGI(TAG, "Vision camera online: %s", ping_resp);
+      rover_log_field_t fields[] = {
+        rover_log_field_str("resp", ping_resp),
+      };
+      rover_log_record_t rec = {
+        .level = ESP_LOG_INFO,
+        .component = TAG,
+        .event = "vision_online_boot_ping",
+        .fields = fields,
+        .field_count = sizeof(fields) / sizeof(fields[0]),
+      };
+      rover_log(&rec);
     } else {
-      ESP_LOGW(TAG, "Vision camera not responding (will retry via web)");
+      rover_log_record_t rec = {
+        .level = ESP_LOG_WARN,
+        .component = TAG,
+        .event = "vision_not_responding_boot_ping",
+        .fields = NULL,
+        .field_count = 0,
+      };
+      rover_log(&rec);
     }
   } else {
-    ESP_LOGE(TAG, "Vision UART init failed");
+    rover_log_record_t rec = {
+      .level = ESP_LOG_ERROR,
+      .component = TAG,
+      .event = "vision_uart_init_failed",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec);
   }
 
   draw_boot_status("connecting WiFi...", WIFI_SSID);
@@ -1784,7 +2202,14 @@ extern "C" void app_main(void) {
 
     s_syslog_sock = open_syslog_socket();
     if (s_syslog_sock < 0) {
-      ESP_LOGW(TAG, "Syslog unavailable, continuing without it");
+      rover_log_record_t rec = {
+        .level = ESP_LOG_WARN,
+        .component = TAG,
+        .event = "syslog_unavailable",
+        .fields = NULL,
+        .field_count = 0,
+      };
+      rover_log(&rec);
     }
 
     // Open gripper on boot
@@ -1798,7 +2223,14 @@ extern "C" void app_main(void) {
   } else {
     // Offline fallback — no restart, buttons still work
     s_wifi_connected = false;
-    ESP_LOGW(TAG, "WiFi failed, entering offline fallback");
+    rover_log_record_t rec = {
+      .level = ESP_LOG_WARN,
+      .component = TAG,
+      .event = "wifi_offline_fallback",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec);
     draw_boot_status("OFFLINE", "buttons only");
 
     s_gripper_open = true;
@@ -1820,10 +2252,29 @@ extern "C" void app_main(void) {
   // WiFi reconnect task — Core 1, low priority
   xTaskCreatePinnedToCore(wifi_reconnect_task, "wifi_reconn", 4096, NULL, 2, NULL, 1);
 
+  // Vision ping task — Core 1, low priority (keeps camera health checks off main_loop)
+  if (vision_uart_ready) {
+    xTaskCreatePinnedToCore(vision_ping_task, "vision_ping", 4096, NULL, 2, NULL, 1);
+  }
+
   // Main loop — Core 0 (RT core, motors, buttons, display)
   xTaskCreatePinnedToCore(main_loop_task, "main_loop", 4096, NULL, 5, NULL, 0);
 
-  ESP_LOGI(TAG, "ESP-IDF rover init complete, tasks started");
-  send_syslog("Boot complete (idf-only)");
+  rover_log_record_t rec1 = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "init_tasks_started",
+    .fields = NULL,
+    .field_count = 0,
+  };
+  rover_log(&rec1);
+  rover_log_record_t rec2 = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "boot_complete",
+    .fields = NULL,
+    .field_count = 0,
+  };
+  rover_log(&rec2);
   // app_main returns — FreeRTOS scheduler continues
 }

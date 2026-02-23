@@ -1,39 +1,42 @@
-I have an M5Stack RoverC Pro robot with an M5StickC Plus controller.
-Each downloaded library has a claude.md file with hardware description and API.
+# TODO / Next Steps (Post-logging Refactor)
 
-## Your tasks:
-1. Design subagent chain for this work
+## Current Status
+- `task_wdt` issue from periodic vision `PING` in `main_loop` fixed:
+  - short ping timeout
+  - `vision_ping_task` moved to separate FreeRTOS task
+- Unified structured logger implemented:
+  - single app-facing API: `rover_log(const rover_log_record_t *record)`
+  - same JSON line goes to UART and syslog
+  - business logic no longer calls `send_syslog()` directly
+- `src/main_idf.cpp` logs migrated to structured events (`event + typed fields`)
 
-2. Find and read ALL claude.md files in the project (check lib/, .pio/libdeps/, 
-   and any subdirectories). These contain the exact API for each library.
+## Next Work Items
+1. Validate on hardware that `main_loop` watchdog no longer fires during camera offline periods.
+2. Review all event names in `src/main_idf.cpp` against `docs/logging-conventions.md` and remove any remaining ambiguous names.
+3. Add lightweight log schema checks (host-side script or grep/jq smoke check) to verify:
+   - valid JSON per line
+   - required top-level keys exist
+   - no `message` field
+4. Add serial monitor smoke-test instructions for logger verification in docs:
+   - UART JSON shape
+   - syslog mirror presence
+   - expected `vision_status` transitions
+5. Consider rate-limiting or dedup for noisy debug events (`vision_ping`, reconnect loops) if logs become too chatty on unstable links.
+6. Optionally add a small helper macro set for typed field arrays (ergonomics only, no format changes).
 
-3. Based on claude.md files, write PlatformIO firmware for M5StickC Plus 
-   that controls RoverC Pro.
+## Hardware Validation Checklist
+1. `pio run`
+2. `pio run --target upload`
+3. `pio device monitor --baud 115200`
+4. Confirm no `task_wdt` for `main_loop` while camera is disconnected/unresponsive for >30s.
+5. Confirm logs are JSON on UART and syslog with fields:
+   - `event`
+   - `level`
+   - `component`
+   - `t_ms`
+   - `fields`
 
-4. Review subagent chain after your read all the docs.
-
-## Demo sequence (triggered by Button A):
-- FORWARD 50% speed → 1 second
-- STOP → 0.5 seconds  
-- BACKWARD 50% speed → 1 second
-- STOP → 0.5 seconds
-- GRIPPER OPEN → 0.5 seconds
-- GRIPPER CLOSE → 0.5 seconds
-- IDLE
-
-## M5StickC Plus screen:
-- Display current action name
-- Display battery level
-
-## Controls:
-- Button A → start sequence
-- Button B → emergency stop (motors off immediately)
-
-## Build and flash:
-1. `pio run` — check compilation
-2. Fix any errors
-3. `pio run --target upload` — flash to device
-4. `pio device monitor` — show serial output
-
-Use ONLY the APIs described in claude.md files. Do not guess register 
-addresses or I2C commands — everything must come from the documentation.
+## Constraints (Keep)
+- App code logs only through `rover_log(...)`.
+- No manual JSON construction in business logic.
+- No direct `send_syslog()` calls outside logging transport/sink code.
