@@ -1,1 +1,1 @@
-idf_component_register(SRCS "main_idf.c")
+idf_component_register(SRCS "main_idf.cpp")

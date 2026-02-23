@@ -15,6 +15,12 @@ sessions/
 history.jsonl
 auth.json
 
+# ESP-IDF managed components (auto-downloaded)
+managed_components/
+
+# Figma capture HTML (throwaway)
+docs/figma/
+
 # Environment files
 .env
 .env.*
