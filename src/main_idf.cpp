@@ -48,6 +48,7 @@ static const TickType_t kAiActionResultTimeoutSlack = pdMS_TO_TICKS(1000);
 static const TickType_t kAiStopActionTimeout = pdMS_TO_TICKS(7000);
 static const int kAiActionQueueDepth = 4;
 static const int kAiHttpTimeoutMs = 15000;
+static const int kAiToolCallMaxIterations = 48;
 static const TickType_t kWifiConnectTimeout = pdMS_TO_TICKS(30000);
 static const TickType_t kInactivitySleepTimeout = pdMS_TO_TICKS(120000);
 static const int WIFI_CONNECTED_BIT = BIT0;
@@ -79,6 +80,8 @@ static const int kVisionCaptureTimeoutMs = 12000;
 static const int kCaptureMaxJpegBytes = 40960;   // 40KB K210 limit
 static const int kCaptureDefaultQuality = 75;
 static const int kCaptureChunkSize = 2048;
+static const int kVisionCaptureRetryCount = 3;
+static const TickType_t kVisionCaptureRetryDelay = pdMS_TO_TICKS(150);
 #define VISION_RESP_MAX 512
 
 // ── Rover FSM ──
@@ -129,10 +132,12 @@ static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num;
 static int s_syslog_sock = -1;
 static openrouter_handle_t s_ai = NULL;
+static openrouter_handle_t s_ai_vision = NULL;
 static SemaphoreHandle_t s_state_mutex;
 static SemaphoreHandle_t s_i2c_mutex;
 static SemaphoreHandle_t s_power_mutex;
 static SemaphoreHandle_t s_ai_mutex;
+static SemaphoreHandle_t s_ai_vision_mutex;
 static SemaphoreHandle_t s_chat_mutex;
 static SemaphoreHandle_t s_ai_action_queue_mutex;
 static QueueHandle_t s_chat_queue;
@@ -867,6 +872,9 @@ static inline int clamp_int(int v, int lo, int hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
+static char *cb_vision_capture(const char *fn, const char *arguments, void *ud);
+static void init_ai(void);
+
 static char *make_tool_response(const char *status, const char *action) {
   char buf[96];
   snprintf(buf, sizeof(buf), "{\"status\":\"%s\",\"action\":\"%s\"}", status, action);
@@ -1476,6 +1484,22 @@ static char *cb_vision_scan(const char *fn, const char *arguments, void *ud) {
   cJSON *ok_field = cJSON_GetObjectItem(json, "ok");
   cJSON *result = cJSON_GetObjectItem(json, "result");
   if (ok_field && cJSON_IsTrue(ok_field) && result) {
+    bool has_person = false;
+    bool has_objects = false;
+    bool has_face_detection = false;
+    cJSON *person = cJSON_GetObjectItem(result, "person");
+    if (person && cJSON_IsString(person) && person->valuestring) {
+      has_person = (strcmp(person->valuestring, "NONE") != 0);
+    }
+    cJSON *faces_detected = cJSON_GetObjectItem(result, "faces_detected");
+    if (faces_detected && cJSON_IsNumber(faces_detected) && faces_detected->valueint > 0) {
+      has_face_detection = true;
+    }
+    cJSON *objects = cJSON_GetObjectItem(result, "objects");
+    if (objects && cJSON_IsArray(objects) && cJSON_GetArraySize(objects) > 0) {
+      has_objects = true;
+    }
+
     if (!s_vision_available.load(std::memory_order_relaxed)) {
       s_vision_available.store(true, std::memory_order_relaxed);
       rover_log_record_t rec = {
@@ -1487,6 +1511,23 @@ static char *cb_vision_scan(const char *fn, const char *arguments, void *ud) {
       };
       rover_log(&rec);
     }
+
+    if (!has_person && !has_face_detection && !has_objects) {
+      rover_log_record_t rec = {
+        .level = ESP_LOG_INFO,
+        .component = TAG,
+        .event = "tool_vision_scan_fallback_capture",
+        .fields = NULL,
+        .field_count = 0,
+      };
+      rover_log(&rec);
+      cJSON_Delete(json);
+      return cb_vision_capture(
+          "vision_capture",
+          "{\"question\":\"The camera scan found no objects or faces. Describe what is visible in the image in detail.\",\"quality\":75}",
+          NULL);
+    }
+
     char *result_str = cJSON_PrintUnformatted(result);
     cJSON_Delete(json);
     return result_str ? result_str : make_tool_response("memory_error", "vision_scan");
@@ -1496,6 +1537,171 @@ static char *cb_vision_scan(const char *fn, const char *arguments, void *ud) {
   char *raw = cJSON_PrintUnformatted(json);
   cJSON_Delete(json);
   return raw ? raw : make_tool_response("error", "vision_scan");
+}
+
+static char *cb_vision_capture(const char *fn, const char *arguments, void *ud) {
+  (void)fn; (void)ud;
+
+  int quality = kCaptureDefaultQuality;
+  char question[240] = "Describe what is visible in this rover camera image. Be concise and concrete.";
+
+  cJSON *args = cJSON_Parse(arguments ? arguments : "{}");
+  if (args) {
+    cJSON *q = cJSON_GetObjectItem(args, "quality");
+    if (q && cJSON_IsNumber(q)) {
+      quality = q->valueint;
+    }
+    cJSON *prompt = cJSON_GetObjectItem(args, "question");
+    if (prompt && cJSON_IsString(prompt) && prompt->valuestring && prompt->valuestring[0] != '\0') {
+      strlcpy(question, prompt->valuestring, sizeof(question));
+    }
+    cJSON_Delete(args);
+  }
+  quality = clamp_int(quality, 30, 95);
+
+  mark_activity();
+  rover_log_field_t start_fields[] = {
+    rover_log_field_int("quality", quality),
+  };
+  rover_log_record_t start_rec = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "tool_vision_capture",
+    .fields = start_fields,
+    .field_count = sizeof(start_fields) / sizeof(start_fields[0]),
+  };
+  rover_log(&start_rec);
+
+  if (s_ai_vision == NULL || s_ai_vision_mutex == NULL) {
+    return make_tool_response("ai_vision_unavailable", "vision_capture");
+  }
+  if (s_vision_mutex == NULL) {
+    return make_tool_response("camera_unavailable", "vision_capture");
+  }
+
+  uint8_t *jpeg = NULL;
+  size_t jpeg_size = 0;
+  esp_err_t cap_err = ESP_FAIL;
+  for (int attempt = 1; attempt <= kVisionCaptureRetryCount; ++attempt) {
+    xSemaphoreTake(s_vision_mutex, portMAX_DELAY);
+    cap_err = vision_capture(quality, &jpeg, &jpeg_size);
+    xSemaphoreGive(s_vision_mutex);
+    if (cap_err == ESP_OK && jpeg != NULL && jpeg_size > 0) {
+      break;
+    }
+    if (jpeg != NULL) {
+      free(jpeg);
+      jpeg = NULL;
+      jpeg_size = 0;
+    }
+    if (attempt < kVisionCaptureRetryCount) {
+      rover_log_field_t retry_fields[] = {
+        rover_log_field_int("attempt", attempt),
+        rover_log_field_str("err", esp_err_to_name(cap_err)),
+      };
+      rover_log_record_t retry_rec = {
+        .level = ESP_LOG_DEBUG,
+        .component = TAG,
+        .event = "tool_vision_capture_retry",
+        .fields = retry_fields,
+        .field_count = sizeof(retry_fields) / sizeof(retry_fields[0]),
+      };
+      rover_log(&retry_rec);
+      vTaskDelay(kVisionCaptureRetryDelay);
+    }
+  }
+  if (cap_err != ESP_OK || jpeg == NULL || jpeg_size == 0) {
+    s_vision_available.store(false, std::memory_order_relaxed);
+    rover_log_field_t fields[] = {
+      rover_log_field_str("err", esp_err_to_name(cap_err)),
+    };
+    rover_log_record_t rec = {
+      .level = ESP_LOG_WARN,
+      .component = TAG,
+      .event = "tool_vision_capture_failed",
+      .fields = fields,
+      .field_count = sizeof(fields) / sizeof(fields[0]),
+    };
+    rover_log(&rec);
+    return make_tool_response("camera_capture_failed", "vision_capture");
+  }
+
+  if (!s_vision_available.load(std::memory_order_relaxed)) {
+    s_vision_available.store(true, std::memory_order_relaxed);
+    rover_log_record_t rec = {
+      .level = ESP_LOG_INFO,
+      .component = TAG,
+      .event = "vision_available_via_capture",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec);
+  }
+
+  char vision_prompt[768];
+  strlcpy(
+      vision_prompt,
+      "Analyze this rover camera image and answer ONLY as compact JSON with fields: "
+      "target_present (true/false/null), target_label (string), target_position "
+      "(left|center|right|unknown), target_distance (near|mid|far|unknown), "
+      "confidence (0..1), visible_objects (array of strings), scene_summary (string). "
+      "Map common Russian/English synonyms for target objects (sofa/couch/divan, chair/armchair). "
+      "If no specific target is requested, set target_present to null. "
+      "User question: ",
+      sizeof(vision_prompt));
+  strlcat(vision_prompt, question, sizeof(vision_prompt));
+
+  char mm_resp[CHAT_RESPONSE_MAX];
+  mm_resp[0] = '\0';
+  xSemaphoreTake(s_ai_vision_mutex, portMAX_DELAY);
+  esp_err_t mm_err = openrouter_call_with_image_data(
+      s_ai_vision, vision_prompt, jpeg, jpeg_size, mm_resp, sizeof(mm_resp));
+  xSemaphoreGive(s_ai_vision_mutex);
+  free(jpeg);
+
+  if (mm_err != ESP_OK) {
+    rover_log_field_t fields[] = {
+      rover_log_field_str("err", esp_err_to_name(mm_err)),
+    };
+    rover_log_record_t rec = {
+      .level = ESP_LOG_WARN,
+      .component = TAG,
+      .event = "tool_vision_capture_ai_failed",
+      .fields = fields,
+      .field_count = sizeof(fields) / sizeof(fields[0]),
+    };
+    rover_log(&rec);
+    return make_tool_response("ai_vision_failed", "vision_capture");
+  }
+
+  cJSON *out = cJSON_CreateObject();
+  if (!out) {
+    return make_tool_response("memory_error", "vision_capture");
+  }
+  cJSON_AddStringToObject(out, "status", "ok");
+  cJSON_AddStringToObject(out, "action", "vision_capture");
+  cJSON_AddNumberToObject(out, "jpeg_bytes", (double)jpeg_size);
+  cJSON_AddStringToObject(out, "analysis", mm_resp);
+  cJSON *analysis_json = cJSON_Parse(mm_resp);
+  if (analysis_json != NULL) {
+    cJSON_AddItemToObject(out, "analysis_json", analysis_json);
+  }
+  char *payload = cJSON_PrintUnformatted(out);
+  cJSON_Delete(out);
+
+  rover_log_field_t done_fields[] = {
+    rover_log_field_int("jpeg_bytes", (int64_t)jpeg_size),
+  };
+  rover_log_record_t done_rec = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "tool_vision_capture_done",
+    .fields = done_fields,
+    .field_count = sizeof(done_fields) / sizeof(done_fields[0]),
+  };
+  rover_log(&done_rec);
+
+  return payload ? payload : make_tool_response("memory_error", "vision_capture");
 }
 
 static void chat_worker_task(void *arg) {
@@ -1527,7 +1733,8 @@ static void chat_worker_task(void *arg) {
       strlcpy(response, "AI unavailable", sizeof(response));
     } else {
       xSemaphoreTake(s_ai_mutex, portMAX_DELAY);
-      err = openrouter_call_with_tools(s_ai, job.prompt, response, sizeof(response), 5);
+      err = openrouter_call_with_tools(
+          s_ai, job.prompt, response, sizeof(response), kAiToolCallMaxIterations);
       xSemaphoreGive(s_ai_mutex);
     }
 
@@ -1920,7 +2127,30 @@ static esp_err_t handle_chat(httpd_req_t *req) {
     httpd_resp_set_status(req, "400 Bad Request");
     return httpd_resp_send(req, "{\"ok\":false,\"error\":\"missing msg\"}", HTTPD_RESP_USE_STRLEN);
   }
+  if (s_ai == NULL && s_wifi_connected.load(std::memory_order_relaxed)) {
+    rover_log_record_t rec = {
+      .level = ESP_LOG_WARN,
+      .component = TAG,
+      .event = "ai_lazy_reinit_attempt",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec);
+    if (s_ai_mutex != NULL) xSemaphoreTake(s_ai_mutex, portMAX_DELAY);
+    if (s_ai == NULL) {
+      init_ai();
+    }
+    if (s_ai_mutex != NULL) xSemaphoreGive(s_ai_mutex);
+  }
   if (s_ai == NULL || s_chat_queue == NULL) {
+    rover_log_record_t rec = {
+      .level = ESP_LOG_ERROR,
+      .component = TAG,
+      .event = "chat_ai_unavailable",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec);
     httpd_resp_set_status(req, "503 Service Unavailable");
     return httpd_resp_send(req, "{\"ok\":false,\"error\":\"ai unavailable\"}", HTTPD_RESP_USE_STRLEN);
   }
@@ -2054,6 +2284,11 @@ static void start_web_server(void) {
 
 static void init_ai(void) {
   static const char *kTurnDirEnum[] = {"left", "right", NULL};
+  static const openrouter_param_t kVisionCaptureParams[] = {
+      {"question", "string", "What to inspect in the camera image (optional).", false, NULL},
+      {"quality", "number", "JPEG quality 30..95 (optional, default 75).", false, NULL},
+      {NULL, NULL, NULL, false, NULL},
+  };
   static const openrouter_param_t kMoveParams[] = {
       {"x", "number", "Lateral speed -100..100 (left negative)", true, NULL},
       {"y", "number", "Forward speed -100..100 (back negative)", true, NULL},
@@ -2075,6 +2310,7 @@ static void init_ai(void) {
       {"gripper_close", "Close the rover gripper.", NULL, cb_gripper_close, NULL},
       {"read_imu", "Read current accelerometer and gyroscope values.", NULL, cb_read_imu, NULL},
       {"vision_scan", "Look at the scene using the camera. Returns detected faces and objects.", NULL, cb_vision_scan, NULL},
+      {"vision_capture", "Capture a camera image and analyze it with a vision model. Use for detailed visual questions.", kVisionCaptureParams, cb_vision_capture, NULL},
   };
 
   openrouter_config_t cfg = {};
@@ -2085,14 +2321,19 @@ static void init_ai(void) {
   cfg.max_tokens = 256;
   cfg.default_model = "openai/gpt-4o-mini";
   cfg.default_system_role =
-      "You are the AI brain of a mecanum-wheel rover robot with a gripper and camera. "
-      "Use the provided tools to control the rover when the user asks. "
-      "For movement commands with duration, call move() which blocks for the specified time then stops. "
-      "For angle-based rotations, use turn(direction, angle_deg) which uses IMU feedback. "
-      "You can inspect sensors with read_imu(). "
-      "Use vision_scan() to look at the scene — it returns detected faces (person field) and objects. "
-      "You can chain multiple tool calls for sequences like 'look around then move forward'. "
-      "Respond naturally in the user's language. Be brief.";
+      "You control a mecanum rover with gripper and a fixed front-facing camera. "
+      "Camera does not pan/tilt; change view only by move() or turn(). "
+      "Use tools directly when user gives a command; do not ask permission first. "
+      "If you say you will scan/look/check, call the tool in the same response. "
+      "Use move() for timed movement, turn() for angle rotation (IMU), stop() for immediate stop. "
+      "Use vision_scan() for fast structured detections (faces/objects). "
+      "Use vision_capture(question=...) for detailed image understanding (scene, colors, text, named objects). "
+      "For named-object search (sofa/couch/divan, chair/armchair, etc.), prefer vision_capture with a targeted question and synonyms. "
+      "When searching, use the returned object presence and approximate frame position (left/center/right, near/far) to decide turning. "
+      "For sweep search, track total rotation and stop after one full 360-degree sweep unless user explicitly asks to continue. "
+      "If the requested object is found, stop turning immediately and report it. "
+      "vision_scan/vision_capture do not provide precise coordinates or distance; avoid endless move-scan loops. "
+      "Respond briefly in the user's language.";
   s_ai = openrouter_create(&cfg);
   if (s_ai == NULL) {
     rover_log_record_t rec1 = {
@@ -2112,6 +2353,25 @@ static void init_ai(void) {
     };
     rover_log(&rec2);
     return;
+  }
+
+  openrouter_config_t vision_cfg = cfg;
+  vision_cfg.enable_tools = false;
+  vision_cfg.max_tokens = 192;
+  vision_cfg.default_system_role =
+      "You analyze rover camera images. "
+      "Answer the user's question using the image. "
+      "Be concise, concrete, and avoid speculation.";
+  s_ai_vision = openrouter_create(&vision_cfg);
+  if (s_ai_vision == NULL) {
+    rover_log_record_t rec = {
+      .level = ESP_LOG_WARN,
+      .component = TAG,
+      .event = "ai_vision_init_failed",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec);
   }
 
   esp_err_t reg_err = ESP_OK;
@@ -2429,7 +2689,36 @@ static void vision_ping_task(void *arg) {
             vision_cmd_timeout("PING", "{}", ping_resp, sizeof(ping_resp), kVisionPingTimeoutMs);
         xSemaphoreGive(s_vision_mutex);
         bool was = s_vision_available.load(std::memory_order_relaxed);
-        bool now_available = (ping_err == ESP_OK && strstr(ping_resp, "\"ok\":true") != NULL);
+        bool now_available = false;
+        bool ping_busy = false;
+        bool ping_error_response = false;
+        bool ping_bad_json = false;
+        char ping_error_code[24] = {0};
+
+        if (ping_err == ESP_OK) {
+          cJSON *json = cJSON_Parse(ping_resp);
+          if (json) {
+            cJSON *ok_field = cJSON_GetObjectItem(json, "ok");
+            if (cJSON_IsTrue(ok_field)) {
+              now_available = true;
+            } else if (cJSON_IsFalse(ok_field)) {
+              ping_error_response = true;
+              cJSON *error_obj = cJSON_GetObjectItem(json, "error");
+              cJSON *code_field = error_obj ? cJSON_GetObjectItem(error_obj, "code") : NULL;
+              if (code_field && cJSON_IsString(code_field) && code_field->valuestring) {
+                snprintf(ping_error_code, sizeof(ping_error_code), "%s", code_field->valuestring);
+                if (strcmp(ping_error_code, "BUSY") == 0) {
+                  ping_busy = true;
+                  now_available = true;
+                }
+              }
+            }
+            cJSON_Delete(json);
+          } else {
+            ping_bad_json = true;
+          }
+        }
+
         s_vision_available.store(now_available, std::memory_order_relaxed);
         if (ping_err != ESP_OK) {
           rover_log_field_t fields[] = {
@@ -2442,6 +2731,35 @@ static void vision_ping_task(void *arg) {
             .event = "vision_ping",
             .fields = fields,
             .field_count = sizeof(fields) / sizeof(fields[0]),
+          };
+          rover_log(&rec);
+        } else if (ping_bad_json) {
+          rover_log_field_t fields[] = {
+            rover_log_field_str("result", "bad_json"),
+            rover_log_field_int("resp_len", (int64_t)strlen(ping_resp)),
+          };
+          rover_log_record_t rec = {
+            .level = ESP_LOG_DEBUG,
+            .component = TAG,
+            .event = "vision_ping",
+            .fields = fields,
+            .field_count = sizeof(fields) / sizeof(fields[0]),
+          };
+          rover_log(&rec);
+        } else if (ping_error_response) {
+          rover_log_field_t fields[4];
+          size_t field_count = 0;
+          fields[field_count++] = rover_log_field_str("result", ping_busy ? "busy" : "error_response");
+          if (ping_error_code[0] != '\0') {
+            fields[field_count++] = rover_log_field_str("error_code", ping_error_code);
+          }
+          fields[field_count++] = rover_log_field_int("resp_len", (int64_t)strlen(ping_resp));
+          rover_log_record_t rec = {
+            .level = ESP_LOG_DEBUG,
+            .component = TAG,
+            .event = "vision_ping",
+            .fields = fields,
+            .field_count = field_count,
           };
           rover_log(&rec);
         } else if (!now_available) {
@@ -2650,6 +2968,7 @@ extern "C" void app_main(void) {
   s_i2c_mutex = xSemaphoreCreateMutex();
   s_power_mutex = xSemaphoreCreateMutex();
   s_ai_mutex = xSemaphoreCreateMutex();
+  s_ai_vision_mutex = xSemaphoreCreateMutex();
   s_chat_mutex = xSemaphoreCreateMutex();
   s_ai_action_queue_mutex = xSemaphoreCreateMutex();
   s_vision_mutex = xSemaphoreCreateMutex();
@@ -2658,7 +2977,7 @@ extern "C" void app_main(void) {
   s_ai_action_queue = xQueueCreate(kAiActionQueueDepth, sizeof(ai_action_req_t));
   s_ai_action_result_queue = xQueueCreate(kAiActionQueueDepth, sizeof(ai_action_result_t));
   if (s_state_mutex == NULL || s_i2c_mutex == NULL || s_power_mutex == NULL ||
-      s_ai_mutex == NULL || s_chat_mutex == NULL || s_ai_action_queue_mutex == NULL ||
+      s_ai_mutex == NULL || s_ai_vision_mutex == NULL || s_chat_mutex == NULL || s_ai_action_queue_mutex == NULL ||
       s_vision_mutex == NULL ||
       s_chat_queue == NULL || s_syslog_queue == NULL ||
       s_ai_action_queue == NULL || s_ai_action_result_queue == NULL) {
