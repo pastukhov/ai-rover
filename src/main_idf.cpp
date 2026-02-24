@@ -43,6 +43,11 @@ static const size_t kSyslogPayloadMax = 640;
 static const TickType_t kHeartbeatPeriod = pdMS_TO_TICKS(1000);
 static const TickType_t kVisionPingPeriod = pdMS_TO_TICKS(10000);
 static const TickType_t kLoopPeriod = pdMS_TO_TICKS(20);
+static const TickType_t kAiActionQueueSendTimeout = pdMS_TO_TICKS(100);
+static const TickType_t kAiActionResultTimeoutSlack = pdMS_TO_TICKS(1000);
+static const TickType_t kAiStopActionTimeout = pdMS_TO_TICKS(7000);
+static const int kAiActionQueueDepth = 4;
+static const int kAiHttpTimeoutMs = 15000;
 static const TickType_t kWifiConnectTimeout = pdMS_TO_TICKS(30000);
 static const TickType_t kInactivitySleepTimeout = pdMS_TO_TICKS(120000);
 static const int WIFI_CONNECTED_BIT = BIT0;
@@ -129,18 +134,22 @@ static SemaphoreHandle_t s_i2c_mutex;
 static SemaphoreHandle_t s_power_mutex;
 static SemaphoreHandle_t s_ai_mutex;
 static SemaphoreHandle_t s_chat_mutex;
+static SemaphoreHandle_t s_ai_action_queue_mutex;
 static QueueHandle_t s_chat_queue;
 static QueueHandle_t s_syslog_queue;
+static QueueHandle_t s_ai_action_queue;
+static QueueHandle_t s_ai_action_result_queue;
 static uint32_t s_chat_id = 0;
 static uint32_t s_chat_done_id = 0;
 static bool s_chat_pending = false;
 static esp_err_t s_chat_result_err = ESP_OK;
 static char s_chat_response[CHAT_RESPONSE_MAX];
-static bool s_wifi_connected = false;
+// Cross-core status flags: use atomics for lock-free reads in UI/tasks.
+static std::atomic<bool> s_wifi_connected{false};
 static httpd_handle_t s_httpd = NULL;
 static SemaphoreHandle_t s_vision_mutex;
 static uint32_t s_vision_req_id = 0;
-static bool s_vision_available = false;
+static std::atomic<bool> s_vision_available{false};
 
 static int8_t s_motion_x = 0;
 static int8_t s_motion_y = 0;
@@ -149,11 +158,37 @@ static bool s_motion_active = false;
 static bool s_gripper_open = false;
 static TickType_t s_web_motion_deadline = 0;
 static std::atomic<uint32_t> s_last_activity_tick{0};
+static std::atomic<uint32_t> s_ai_action_req_seq{0};
 
 typedef struct {
   uint32_t id;
   char prompt[CHAT_PROMPT_MAX];
 } chat_job_t;
+
+typedef enum {
+  AI_ACTION_MOVE = 1,
+  AI_ACTION_STOP = 2,
+  AI_ACTION_TURN = 3,
+  AI_ACTION_GRIPPER_OPEN = 4,
+  AI_ACTION_GRIPPER_CLOSE = 5,
+} ai_action_kind_t;
+
+typedef struct {
+  uint32_t req_id;
+  ai_action_kind_t kind;
+  int8_t x;
+  int8_t y;
+  int8_t z;
+  uint16_t duration_ms;
+  uint16_t turn_target_deg;
+  uint16_t turn_timeout_ms;
+} ai_action_req_t;
+
+typedef struct {
+  uint32_t req_id;
+  esp_err_t err;
+  float turn_measured_deg;
+} ai_action_result_t;
 
 static void wifi_event_handler(void *arg,
                                esp_event_base_t event_base,
@@ -167,6 +202,12 @@ static void wifi_event_handler(void *arg,
   }
 
   if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+    s_wifi_connected.store(false, std::memory_order_relaxed);
+    if (s_state_mutex != NULL) {
+      xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+      transition_to(STATE_OFFLINE_FALLBACK);
+      xSemaphoreGive(s_state_mutex);
+    }
     if (s_retry_num < kWifiMaxRetry) {
       esp_wifi_connect();
       s_retry_num++;
@@ -832,6 +873,260 @@ static char *make_tool_response(const char *status, const char *action) {
   return strdup(buf);
 }
 
+static bool ai_action_wait_result_obj(uint32_t req_id, TickType_t timeout, ai_action_result_t *out) {
+  if (s_ai_action_result_queue == NULL) {
+    if (out) {
+      *out = {};
+      out->req_id = req_id;
+      out->err = ESP_ERR_INVALID_STATE;
+    }
+    return false;
+  }
+
+  TickType_t deadline = xTaskGetTickCount() + timeout;
+  while (1) {
+    TickType_t now = xTaskGetTickCount();
+    if ((int32_t)(deadline - now) <= 0) {
+      if (out) {
+        *out = {};
+        out->req_id = req_id;
+        out->err = ESP_ERR_TIMEOUT;
+      }
+      return false;
+    }
+    TickType_t remaining = deadline - now;
+
+    ai_action_result_t result = {};
+    if (xQueueReceive(s_ai_action_result_queue, &result, remaining) != pdTRUE) {
+      if (out) {
+        *out = {};
+        out->req_id = req_id;
+        out->err = ESP_ERR_TIMEOUT;
+      }
+      return false;
+    }
+    if (result.req_id == req_id) {
+      if (out) *out = result;
+      return true;
+    }
+    if (result.req_id > req_id) {
+      // Should not happen with serialized tool callbacks, but preserve the future result if it does.
+      (void)xQueueSendToFront(s_ai_action_result_queue, &result, 0);
+      if (out) {
+        *out = {};
+        out->req_id = req_id;
+        out->err = ESP_FAIL;
+      }
+      return false;
+    }
+    // result.req_id < req_id: stale result from a timed-out earlier callback, drop it and continue.
+  }
+}
+
+static bool ai_action_wait_result(uint32_t req_id, TickType_t timeout, esp_err_t *err_out) {
+  ai_action_result_t result = {};
+  bool ok = ai_action_wait_result_obj(req_id, timeout, &result);
+  if (err_out) *err_out = result.err;
+  return ok;
+}
+
+static void ai_action_send_result_obj(const ai_action_result_t *src) {
+  if (s_ai_action_result_queue == NULL || src == NULL) return;
+
+  ai_action_result_t result = *src;
+  if (xQueueSend(s_ai_action_result_queue, &result, 0) == pdTRUE) {
+    return;
+  }
+
+  ai_action_result_t dropped = {};
+  (void)xQueueReceive(s_ai_action_result_queue, &dropped, 0);
+  (void)xQueueSend(s_ai_action_result_queue, &result, 0);
+}
+
+static void ai_action_send_result(uint32_t req_id, esp_err_t err) {
+  ai_action_result_t result = {
+    .req_id = req_id,
+    .err = err,
+    .turn_measured_deg = 0.0f,
+  };
+  ai_action_send_result_obj(&result);
+}
+
+static void ai_action_apply_stop_state(void) {
+  rover_emergency_stop();
+  xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+  set_motion(0, 0, 0, false);
+  s_web_motion_deadline = 0;
+  xSemaphoreGive(s_state_mutex);
+}
+
+static bool ai_action_drain_and_process_stop(void) {
+  if (s_ai_action_queue == NULL) return false;
+  if (s_ai_action_queue_mutex == NULL) return false;
+
+  ai_action_req_t pending[kAiActionQueueDepth];
+  int pending_count = 0;
+  bool stop_processed = false;
+
+  xSemaphoreTake(s_ai_action_queue_mutex, portMAX_DELAY);
+  ai_action_req_t queued = {};
+  while (xQueueReceive(s_ai_action_queue, &queued, 0) == pdTRUE) {
+    if (queued.kind == AI_ACTION_STOP) {
+      ai_action_apply_stop_state();
+      ai_action_send_result(queued.req_id, ESP_OK);
+      stop_processed = true;
+      continue;
+    }
+    if (pending_count < kAiActionQueueDepth) {
+      pending[pending_count++] = queued;
+    }
+  }
+
+  for (int i = 0; i < pending_count; i++) {
+    (void)xQueueSend(s_ai_action_queue, &pending[i], 0);
+  }
+  xSemaphoreGive(s_ai_action_queue_mutex);
+  return stop_processed;
+}
+
+static esp_err_t ai_action_execute_on_core0(const ai_action_req_t *req, ai_action_result_t *result_out) {
+  if (req == NULL) return ESP_ERR_INVALID_ARG;
+  if (result_out) {
+    *result_out = {};
+    result_out->req_id = req->req_id;
+    result_out->err = ESP_OK;
+  }
+
+  rover_state_t prev_state = STATE_IDLE;
+  bool restore_ai_state = false;
+  xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+  prev_state = s_rover_state;
+  if (s_rover_state == STATE_AI_THINKING || s_rover_state == STATE_AI_EXECUTING) {
+    transition_to(STATE_AI_EXECUTING);
+    restore_ai_state = true;
+  }
+  xSemaphoreGive(s_state_mutex);
+
+  esp_err_t action_err = ESP_OK;
+  if (req->kind == AI_ACTION_MOVE) {
+    TickType_t end = xTaskGetTickCount() + pdMS_TO_TICKS(req->duration_ms);
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    set_motion(req->x, req->y, req->z, (req->x != 0 || req->y != 0 || req->z != 0));
+    xSemaphoreGive(s_state_mutex);
+
+    while ((int32_t)(end - xTaskGetTickCount()) > 0) {
+      esp_task_wdt_reset();
+      M5.update();
+      if (M5.BtnB.isPressed()) {
+        action_err = ESP_ERR_INVALID_STATE;
+        break;
+      }
+      if (ai_action_drain_and_process_stop()) {
+        action_err = ESP_ERR_INVALID_STATE;
+        break;
+      }
+      esp_err_t err = rover_set_speed(req->x, req->y, req->z);
+      if (action_err == ESP_OK && err != ESP_OK) action_err = err;
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    esp_err_t stop_err = rover_set_speed(0, 0, 0);
+    if (action_err == ESP_OK && stop_err != ESP_OK) action_err = stop_err;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    set_motion(0, 0, 0, false);
+    xSemaphoreGive(s_state_mutex);
+  } else if (req->kind == AI_ACTION_TURN) {
+    float turned = 0.0f;
+    float target = (float)req->turn_target_deg;
+    TickType_t start_tick = xTaskGetTickCount();
+    uint32_t prev_ms = (uint32_t)(esp_log_timestamp());
+    while (turned < target &&
+           (xTaskGetTickCount() - start_tick) < pdMS_TO_TICKS(req->turn_timeout_ms)) {
+      esp_task_wdt_reset();
+      M5.update();
+      if (M5.BtnB.isPressed()) {
+        action_err = ESP_ERR_INVALID_STATE;
+        break;
+      }
+      if (ai_action_drain_and_process_stop()) {
+        action_err = ESP_ERR_INVALID_STATE;
+        break;
+      }
+
+      float gx = 0, gy = 0, gz = 0;
+      M5.Imu.getGyro(&gx, &gy, &gz);
+      uint32_t now_ms = (uint32_t)(esp_log_timestamp());
+      float dt_s = (float)(now_ms - prev_ms) / 1000.0f;
+      prev_ms = now_ms;
+
+      esp_err_t err = rover_set_speed(0, 0, req->z);
+      if (action_err == ESP_OK && err != ESP_OK) action_err = err;
+
+      float rate = fabsf(gx);
+      if (fabsf(gy) > rate) rate = fabsf(gy);
+      if (fabsf(gz) > rate) rate = fabsf(gz);
+      if (rate > 3.0f) {
+        turned += rate * dt_s;
+      }
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    esp_err_t stop_err = rover_set_speed(0, 0, 0);
+    if (action_err == ESP_OK && stop_err != ESP_OK) action_err = stop_err;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    set_motion(0, 0, 0, false);
+    xSemaphoreGive(s_state_mutex);
+
+    if (action_err == ESP_OK && turned < target) {
+      action_err = ESP_ERR_TIMEOUT;
+    }
+    if (result_out) {
+      result_out->turn_measured_deg = turned;
+    }
+  } else if (req->kind == AI_ACTION_STOP) {
+    ai_action_apply_stop_state();
+  } else if (req->kind == AI_ACTION_GRIPPER_OPEN || req->kind == AI_ACTION_GRIPPER_CLOSE) {
+    bool open = (req->kind == AI_ACTION_GRIPPER_OPEN);
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_gripper_open = open;
+    xSemaphoreGive(s_state_mutex);
+    esp_err_t servo_err = rover_set_servo_angle(kGripperServo, open ? kGripperOpenAngle : kGripperCloseAngle);
+    if (action_err == ESP_OK && servo_err != ESP_OK) action_err = servo_err;
+  } else {
+    action_err = ESP_ERR_INVALID_ARG;
+  }
+
+  xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+  if (restore_ai_state) {
+    transition_to(prev_state);
+  }
+  xSemaphoreGive(s_state_mutex);
+
+  if (result_out) {
+    result_out->err = action_err;
+  }
+  return action_err;
+}
+
+static void ai_action_poll_and_execute(void) {
+  if (s_ai_action_queue == NULL) return;
+  if (s_ai_action_queue_mutex == NULL) return;
+  ai_action_req_t req = {};
+  xSemaphoreTake(s_ai_action_queue_mutex, portMAX_DELAY);
+  BaseType_t got = xQueueReceive(s_ai_action_queue, &req, 0);
+  xSemaphoreGive(s_ai_action_queue_mutex);
+  if (got != pdTRUE) {
+    return;
+  }
+  ai_action_result_t result = {
+    .req_id = req.req_id,
+    .err = ESP_OK,
+    .turn_measured_deg = 0.0f,
+  };
+  result.err = ai_action_execute_on_core0(&req, &result);
+  ai_action_send_result_obj(&result);
+}
+
 static char *cb_move(const char *fn, const char *arguments, void *ud) {
   (void)fn; (void)ud;
   int x = 0, y = 0, z = 0, duration_ms = 1500;
@@ -865,15 +1160,37 @@ static char *cb_move(const char *fn, const char *arguments, void *ud) {
   };
   rover_log(&rec);
 
-  TickType_t end = xTaskGetTickCount() + pdMS_TO_TICKS(duration_ms);
-  while (xTaskGetTickCount() < end) {
-    (void)rover_set_speed((int8_t)x, (int8_t)y, (int8_t)z);
-    vTaskDelay(pdMS_TO_TICKS(50));
+  if (s_ai_action_queue == NULL) {
+    return make_tool_response("unavailable", "move");
   }
-  (void)rover_set_speed(0, 0, 0);
-  xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-  set_motion(0, 0, 0, false);
-  xSemaphoreGive(s_state_mutex);
+  if (s_ai_action_queue_mutex == NULL) {
+    return make_tool_response("unavailable", "move");
+  }
+
+  ai_action_req_t req = {
+    .req_id = ++s_ai_action_req_seq,
+    .kind = AI_ACTION_MOVE,
+    .x = (int8_t)x,
+    .y = (int8_t)y,
+    .z = (int8_t)z,
+    .duration_ms = (uint16_t)duration_ms,
+    .turn_target_deg = 0,
+    .turn_timeout_ms = 0,
+  };
+  xSemaphoreTake(s_ai_action_queue_mutex, portMAX_DELAY);
+  BaseType_t sent = xQueueSend(s_ai_action_queue, &req, 0);
+  xSemaphoreGive(s_ai_action_queue_mutex);
+  if (sent != pdTRUE) {
+    return make_tool_response("busy", "move");
+  }
+  esp_err_t action_err = ESP_OK;
+  TickType_t wait_timeout = pdMS_TO_TICKS(duration_ms) + kAiActionResultTimeoutSlack;
+  if (!ai_action_wait_result(req.req_id, wait_timeout, &action_err)) {
+    return make_tool_response("timeout", "move");
+  }
+  if (action_err != ESP_OK) {
+    return make_tool_response("failed", "move");
+  }
 
   return make_tool_response("ok", "move"); // openrouter_client frees this
 }
@@ -923,46 +1240,53 @@ static char *cb_turn(const char *fn, const char *arguments, void *ud) {
   };
   rover_log(&rec);
 
-  float turned = 0.0f;
-  TickType_t start_tick = xTaskGetTickCount();
-  uint32_t prev_ms = (uint32_t)(esp_log_timestamp());
-  while (turned < target &&
-         (xTaskGetTickCount() - start_tick) < pdMS_TO_TICKS(timeout_ms)) {
-    float gx = 0, gy = 0, gz = 0;
-    M5.Imu.getGyro(&gx, &gy, &gz);
-    uint32_t now_ms = (uint32_t)(esp_log_timestamp());
-    float dt_s = (float)(now_ms - prev_ms) / 1000.0f;
-    prev_ms = now_ms;
-
-    (void)rover_set_speed(0, 0, turn_z);
-    float rate = fabsf(gx);
-    if (fabsf(gy) > rate) rate = fabsf(gy);
-    if (fabsf(gz) > rate) rate = fabsf(gz);
-    if (rate > 3.0f) {
-      turned += rate * dt_s;
-    }
-    vTaskDelay(pdMS_TO_TICKS(20));
+  if (s_ai_action_queue == NULL) {
+    return make_tool_response("unavailable", "turn");
   }
-  (void)rover_set_speed(0, 0, 0);
-  xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-  set_motion(0, 0, 0, false);
-  xSemaphoreGive(s_state_mutex);
+  if (s_ai_action_queue_mutex == NULL) {
+    return make_tool_response("unavailable", "turn");
+  }
+
+  ai_action_req_t req = {
+    .req_id = ++s_ai_action_req_seq,
+    .kind = AI_ACTION_TURN,
+    .x = 0,
+    .y = 0,
+    .z = turn_z,
+    .duration_ms = 0,
+    .turn_target_deg = (uint16_t)target,
+    .turn_timeout_ms = (uint16_t)timeout_ms,
+  };
+  xSemaphoreTake(s_ai_action_queue_mutex, portMAX_DELAY);
+  BaseType_t sent = xQueueSend(s_ai_action_queue, &req, 0);
+  xSemaphoreGive(s_ai_action_queue_mutex);
+  if (sent != pdTRUE) {
+    return make_tool_response("busy", "turn");
+  }
+
+  ai_action_result_t result = {};
+  TickType_t wait_timeout = pdMS_TO_TICKS(timeout_ms) + kAiActionResultTimeoutSlack;
+  if (!ai_action_wait_result_obj(req.req_id, wait_timeout, &result)) {
+    result.err = ESP_ERR_TIMEOUT;
+  }
+
+  const char *status = "failed";
+  if (result.err == ESP_OK) {
+    status = "ok";
+  } else if (result.err == ESP_ERR_TIMEOUT) {
+    status = "timeout";
+  }
 
   char payload[160];
   snprintf(payload, sizeof(payload),
            "{\"status\":\"%s\",\"action\":\"turn\",\"target_deg\":%.1f,\"measured_deg\":%.1f}",
-           turned >= target ? "ok" : "timeout", (double)target, (double)turned);
+           status, (double)target, (double)result.turn_measured_deg);
   return strdup(payload); // openrouter_client frees this
 }
 
 static char *cb_stop(const char *fn, const char *arguments, void *ud) {
   (void)fn; (void)arguments; (void)ud;
   mark_activity();
-  rover_emergency_stop();
-  xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-  set_motion(0, 0, 0, false);
-  s_web_motion_deadline = 0;
-  xSemaphoreGive(s_state_mutex);
   rover_log_record_t rec = {
     .level = ESP_LOG_INFO,
     .component = TAG,
@@ -971,16 +1295,73 @@ static char *cb_stop(const char *fn, const char *arguments, void *ud) {
     .field_count = 0,
   };
   rover_log(&rec);
+
+  if (s_ai_action_queue == NULL) {
+    return make_tool_response("unavailable", "stop");
+  }
+  if (s_ai_action_queue_mutex == NULL) {
+    return make_tool_response("unavailable", "stop");
+  }
+
+  ai_action_req_t req = {
+    .req_id = ++s_ai_action_req_seq,
+    .kind = AI_ACTION_STOP,
+    .x = 0,
+    .y = 0,
+    .z = 0,
+    .duration_ms = 0,
+    .turn_target_deg = 0,
+    .turn_timeout_ms = 0,
+  };
+  xSemaphoreTake(s_ai_action_queue_mutex, portMAX_DELAY);
+  BaseType_t sent = xQueueSend(s_ai_action_queue, &req, 0);
+  xSemaphoreGive(s_ai_action_queue_mutex);
+  if (sent != pdTRUE) {
+    return make_tool_response("busy", "stop");
+  }
+  esp_err_t action_err = ESP_OK;
+  if (!ai_action_wait_result(req.req_id, kAiStopActionTimeout, &action_err)) {
+    return make_tool_response("timeout", "stop");
+  }
+  if (action_err != ESP_OK) {
+    return make_tool_response("failed", "stop");
+  }
+
   return make_tool_response("ok", "stop"); // openrouter_client frees this
 }
 
 static char *cb_gripper_open(const char *fn, const char *arguments, void *ud) {
   (void)fn; (void)arguments; (void)ud;
   mark_activity();
-  xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-  s_gripper_open = true;
-  xSemaphoreGive(s_state_mutex);
-  (void)rover_set_servo_angle(kGripperServo, kGripperOpenAngle);
+  if (s_ai_action_queue == NULL) {
+    return make_tool_response("unavailable", "gripper_open");
+  }
+  if (s_ai_action_queue_mutex == NULL) {
+    return make_tool_response("unavailable", "gripper_open");
+  }
+  ai_action_req_t req = {
+    .req_id = ++s_ai_action_req_seq,
+    .kind = AI_ACTION_GRIPPER_OPEN,
+    .x = 0,
+    .y = 0,
+    .z = 0,
+    .duration_ms = 0,
+    .turn_target_deg = 0,
+    .turn_timeout_ms = 0,
+  };
+  xSemaphoreTake(s_ai_action_queue_mutex, portMAX_DELAY);
+  BaseType_t sent = xQueueSend(s_ai_action_queue, &req, 0);
+  xSemaphoreGive(s_ai_action_queue_mutex);
+  if (sent != pdTRUE) {
+    return make_tool_response("busy", "gripper_open");
+  }
+  esp_err_t action_err = ESP_OK;
+  if (!ai_action_wait_result(req.req_id, kAiStopActionTimeout, &action_err)) {
+    return make_tool_response("timeout", "gripper_open");
+  }
+  if (action_err != ESP_OK) {
+    return make_tool_response("failed", "gripper_open");
+  }
   rover_log_record_t rec = {
     .level = ESP_LOG_INFO,
     .component = TAG,
@@ -995,10 +1376,35 @@ static char *cb_gripper_open(const char *fn, const char *arguments, void *ud) {
 static char *cb_gripper_close(const char *fn, const char *arguments, void *ud) {
   (void)fn; (void)arguments; (void)ud;
   mark_activity();
-  xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-  s_gripper_open = false;
-  xSemaphoreGive(s_state_mutex);
-  (void)rover_set_servo_angle(kGripperServo, kGripperCloseAngle);
+  if (s_ai_action_queue == NULL) {
+    return make_tool_response("unavailable", "gripper_close");
+  }
+  if (s_ai_action_queue_mutex == NULL) {
+    return make_tool_response("unavailable", "gripper_close");
+  }
+  ai_action_req_t req = {
+    .req_id = ++s_ai_action_req_seq,
+    .kind = AI_ACTION_GRIPPER_CLOSE,
+    .x = 0,
+    .y = 0,
+    .z = 0,
+    .duration_ms = 0,
+    .turn_target_deg = 0,
+    .turn_timeout_ms = 0,
+  };
+  xSemaphoreTake(s_ai_action_queue_mutex, portMAX_DELAY);
+  BaseType_t sent = xQueueSend(s_ai_action_queue, &req, 0);
+  xSemaphoreGive(s_ai_action_queue_mutex);
+  if (sent != pdTRUE) {
+    return make_tool_response("busy", "gripper_close");
+  }
+  esp_err_t action_err = ESP_OK;
+  if (!ai_action_wait_result(req.req_id, kAiStopActionTimeout, &action_err)) {
+    return make_tool_response("timeout", "gripper_close");
+  }
+  if (action_err != ESP_OK) {
+    return make_tool_response("failed", "gripper_close");
+  }
   rover_log_record_t rec = {
     .level = ESP_LOG_INFO,
     .component = TAG,
@@ -1070,8 +1476,8 @@ static char *cb_vision_scan(const char *fn, const char *arguments, void *ud) {
   cJSON *ok_field = cJSON_GetObjectItem(json, "ok");
   cJSON *result = cJSON_GetObjectItem(json, "result");
   if (ok_field && cJSON_IsTrue(ok_field) && result) {
-    if (!s_vision_available) {
-      s_vision_available = true;
+    if (!s_vision_available.load(std::memory_order_relaxed)) {
+      s_vision_available.store(true, std::memory_order_relaxed);
       rover_log_record_t rec = {
         .level = ESP_LOG_INFO,
         .component = TAG,
@@ -1346,7 +1752,7 @@ static esp_err_t handle_status(httpd_req_t *req) {
                    s_motion_y,
                    s_motion_z,
                    s_gripper_open ? "open" : "close",
-                   s_vision_available ? "ok" : "offline",
+                   s_vision_available.load(std::memory_order_relaxed) ? "ok" : "offline",
                    (int)bat_pct,
                    (int)vbus_mv);
   xSemaphoreGive(s_state_mutex);
@@ -1389,12 +1795,12 @@ static esp_err_t handle_vision(httpd_req_t *req) {
     esp_err_t err = vision_capture(quality, &jpeg, &jpeg_size);
     xSemaphoreGive(s_vision_mutex);
     if (err != ESP_OK) {
-      s_vision_available = false;
+      s_vision_available.store(false, std::memory_order_relaxed);
       httpd_resp_set_status(req, "504 Gateway Timeout");
       httpd_resp_set_type(req, "application/json");
       return httpd_resp_send(req, "{\"ok\":false,\"error\":\"capture failed\"}", HTTPD_RESP_USE_STRLEN);
     }
-    s_vision_available = true;
+    s_vision_available.store(true, std::memory_order_relaxed);
     httpd_resp_set_type(req, "image/jpeg");
     esp_err_t send_err = httpd_resp_send(req, (const char *)jpeg, jpeg_size);
     free(jpeg);
@@ -1416,13 +1822,13 @@ static esp_err_t handle_vision(httpd_req_t *req) {
 
   httpd_resp_set_type(req, "application/json");
   if (err != ESP_OK) {
-    s_vision_available = false;
+    s_vision_available.store(false, std::memory_order_relaxed);
     httpd_resp_set_status(req, "504 Gateway Timeout");
     return httpd_resp_send(req, "{\"ok\":false,\"error\":\"camera timeout\"}", HTTPD_RESP_USE_STRLEN);
   }
   // Update availability on any successful response
-  if (!s_vision_available && strstr(resp, "\"ok\":true") != NULL) {
-    s_vision_available = true;
+  if (!s_vision_available.load(std::memory_order_relaxed) && strstr(resp, "\"ok\":true") != NULL) {
+    s_vision_available.store(true, std::memory_order_relaxed);
     rover_log_record_t rec1 = {
       .level = ESP_LOG_INFO,
       .component = TAG,
@@ -1675,6 +2081,7 @@ static void init_ai(void) {
   cfg.api_key = OPENROUTER_API_KEY;
   cfg.enable_streaming = false;
   cfg.enable_tools = true;
+  cfg.http_timeout_ms = kAiHttpTimeoutMs;
   cfg.max_tokens = 256;
   cfg.default_model = "openai/gpt-4o-mini";
   cfg.default_system_role =
@@ -1791,26 +2198,41 @@ static void update_local_display(bool btn_a, bool btn_b, bool chat_active) {
 
   int32_t bat_pct = -1;
   read_power_metrics(NULL, &bat_pct);
+  bool wifi_connected = s_wifi_connected.load(std::memory_order_relaxed);
+  rover_state_t state = STATE_IDLE;
+  int8_t motion_x = 0;
+  int8_t motion_y = 0;
+  int8_t motion_z = 0;
+  bool motion_active = false;
+  bool gripper_open = false;
+  xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+  state = s_rover_state;
+  motion_x = s_motion_x;
+  motion_y = s_motion_y;
+  motion_z = s_motion_z;
+  motion_active = s_motion_active;
+  gripper_open = s_gripper_open;
+  xSemaphoreGive(s_state_mutex);
 
   if (initialized &&
-      prev_state == s_rover_state &&
-      prev_motion_x == s_motion_x &&
-      prev_motion_y == s_motion_y &&
-      prev_motion_z == s_motion_z &&
-      prev_motion_active == s_motion_active &&
-      prev_gripper_open == s_gripper_open &&
+      prev_state == state &&
+      prev_motion_x == motion_x &&
+      prev_motion_y == motion_y &&
+      prev_motion_z == motion_z &&
+      prev_motion_active == motion_active &&
+      prev_gripper_open == gripper_open &&
       prev_btn_a == btn_a &&
       prev_btn_b == btn_b &&
       prev_bat_pct == bat_pct) {
     return;
   }
 
-  prev_state = s_rover_state;
-  prev_motion_x = s_motion_x;
-  prev_motion_y = s_motion_y;
-  prev_motion_z = s_motion_z;
-  prev_motion_active = s_motion_active;
-  prev_gripper_open = s_gripper_open;
+  prev_state = state;
+  prev_motion_x = motion_x;
+  prev_motion_y = motion_y;
+  prev_motion_z = motion_z;
+  prev_motion_active = motion_active;
+  prev_gripper_open = gripper_open;
   prev_btn_a = btn_a;
   prev_btn_b = btn_b;
   prev_bat_pct = bat_pct;
@@ -1829,11 +2251,11 @@ static void update_local_display(bool btn_a, bool btn_b, bool chat_active) {
   M5.Display.fillScreen(bg);
 
   // ── Row 0: FSM state ──
-  uint32_t sc = state_color(s_rover_state);
+  uint32_t sc = state_color(state);
   M5.Display.fillRoundRect(2, 2, 236, 22, 4, sc);
   M5.Display.setTextSize(2);
   M5.Display.setTextColor(TFT_WHITE, sc);
-  const char *sname = state_name(s_rover_state);
+  const char *sname = state_name(state);
   int snw = (int)strlen(sname) * 12;
   M5.Display.setCursor((240 - snw) / 2, 5);
   M5.Display.print(sname);
@@ -1843,17 +2265,17 @@ static void update_local_display(bool btn_a, bool btn_b, bool chat_active) {
   get_ip_str(ip_str, sizeof(ip_str));
   M5.Display.fillRoundRect(2, 34, 236, 22, 4, 0x1F2937u);
   M5.Display.setTextSize(2);
-  M5.Display.setTextColor(s_wifi_connected ? 0x60A5FAu : 0x6B7280u, 0x1F2937u);
+  M5.Display.setTextColor(wifi_connected ? 0x60A5FAu : 0x6B7280u, 0x1F2937u);
   int ipw = (int)strlen(ip_str) * 12;
   M5.Display.setCursor((240 - ipw) / 2, 37);
   M5.Display.print(ip_str);
 
   // ── Row 2: Motion ──
-  if (s_motion_active) {
-    const char *ml = motion_label(s_motion_x, s_motion_y, s_motion_z);
+  if (motion_active) {
+    const char *ml = motion_label(motion_x, motion_y, motion_z);
     char motion_str[48];
     snprintf(motion_str, sizeof(motion_str), "%s  x:%d y:%d z:%d",
-             ml, s_motion_x, s_motion_y, s_motion_z);
+             ml, motion_x, motion_y, motion_z);
     int mlen = (int)strlen(motion_str);
     bool small = (mlen * 12 > 236);
     M5.Display.setTextSize(small ? 1 : 2);
@@ -1872,18 +2294,18 @@ static void update_local_display(bool btn_a, bool btn_b, bool chat_active) {
   const int py = 93;
   M5.Display.setTextSize(1);
 
-  uint32_t gc = s_gripper_open ? 0x10B981u : 0xEF4444u;
+  uint32_t gc = gripper_open ? 0x10B981u : 0xEF4444u;
   M5.Display.fillRoundRect(4, py, 74, 18, 4, gc);
   M5.Display.setTextColor(TFT_WHITE, gc);
-  const char *gl = s_gripper_open ? "GRIP OPEN" : "GRIP SHUT";
+  const char *gl = gripper_open ? "GRIP OPEN" : "GRIP SHUT";
   int glw = (int)strlen(gl) * 6;
   M5.Display.setCursor(4 + (74 - glw) / 2, py + 5);
   M5.Display.print(gl);
 
-  uint32_t wc = s_wifi_connected ? 0x1E40AFu : 0x7F1D1Du;
+  uint32_t wc = wifi_connected ? 0x1E40AFu : 0x7F1D1Du;
   M5.Display.fillRoundRect(82, py, 74, 18, 4, wc);
   M5.Display.setTextColor(TFT_WHITE, wc);
-  const char *wl = s_wifi_connected ? "WiFi OK" : "OFFLINE";
+  const char *wl = wifi_connected ? "WiFi OK" : "OFFLINE";
   int wlw = (int)strlen(wl) * 6;
   M5.Display.setCursor(82 + (74 - wlw) / 2, py + 5);
   M5.Display.print(wl);
@@ -1936,7 +2358,7 @@ static void wifi_reconnect_task(void *arg) {
   (void)arg;
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(15000));
-    if (s_wifi_connected) continue;
+    if (s_wifi_connected.load(std::memory_order_relaxed)) continue;
 
     rover_log_record_t rec = {
       .level = ESP_LOG_INFO,
@@ -1967,7 +2389,7 @@ static void wifi_reconnect_task(void *arg) {
     s_wifi_event_group = NULL;
 
     if (bits & WIFI_CONNECTED_BIT) {
-      s_wifi_connected = true;
+      s_wifi_connected.store(true, std::memory_order_relaxed);
       esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 
       s_syslog_sock = open_syslog_socket();
@@ -1994,7 +2416,9 @@ static void wifi_reconnect_task(void *arg) {
 static void vision_ping_task(void *arg) {
   (void)arg;
 
-  TickType_t last_vision_ping = 0;
+  // Delay the first ping slightly and avoid UART camera traffic in app_main during boot.
+  vTaskDelay(pdMS_TO_TICKS(500));
+  TickType_t last_vision_ping = xTaskGetTickCount() - kVisionPingPeriod;
   while (1) {
     TickType_t now = xTaskGetTickCount();
     if ((now - last_vision_ping) >= kVisionPingPeriod) {
@@ -2004,8 +2428,9 @@ static void vision_ping_task(void *arg) {
         esp_err_t ping_err =
             vision_cmd_timeout("PING", "{}", ping_resp, sizeof(ping_resp), kVisionPingTimeoutMs);
         xSemaphoreGive(s_vision_mutex);
-        bool was = s_vision_available;
-        s_vision_available = (ping_err == ESP_OK && strstr(ping_resp, "\"ok\":true") != NULL);
+        bool was = s_vision_available.load(std::memory_order_relaxed);
+        bool now_available = (ping_err == ESP_OK && strstr(ping_resp, "\"ok\":true") != NULL);
+        s_vision_available.store(now_available, std::memory_order_relaxed);
         if (ping_err != ESP_OK) {
           rover_log_field_t fields[] = {
             rover_log_field_str("result", "error"),
@@ -2019,7 +2444,7 @@ static void vision_ping_task(void *arg) {
             .field_count = sizeof(fields) / sizeof(fields[0]),
           };
           rover_log(&rec);
-        } else if (!s_vision_available) {
+        } else if (!now_available) {
           rover_log_field_t fields[] = {
             rover_log_field_str("result", "bad_response"),
             rover_log_field_int("resp_len", (int64_t)strlen(ping_resp)),
@@ -2033,9 +2458,9 @@ static void vision_ping_task(void *arg) {
           };
           rover_log(&rec);
         }
-        if (s_vision_available != was) {
+        if (now_available != was) {
           rover_log_field_t fields[] = {
-            rover_log_field_str("status", s_vision_available ? "online" : "offline"),
+            rover_log_field_str("status", now_available ? "online" : "offline"),
           };
           rover_log_record_t rec = {
             .level = ESP_LOG_INFO,
@@ -2067,6 +2492,7 @@ static void main_loop_task(void *arg) {
     esp_task_wdt_reset();
 
     M5.update();
+    ai_action_poll_and_execute();
     bool btn_a = M5.BtnA.isPressed();
     bool btn_b = M5.BtnB.isPressed();
 
@@ -2225,13 +2651,17 @@ extern "C" void app_main(void) {
   s_power_mutex = xSemaphoreCreateMutex();
   s_ai_mutex = xSemaphoreCreateMutex();
   s_chat_mutex = xSemaphoreCreateMutex();
+  s_ai_action_queue_mutex = xSemaphoreCreateMutex();
   s_vision_mutex = xSemaphoreCreateMutex();
   s_chat_queue = xQueueCreate(1, sizeof(chat_job_t));
   s_syslog_queue = xQueueCreate(8, kSyslogMsgMax);
+  s_ai_action_queue = xQueueCreate(kAiActionQueueDepth, sizeof(ai_action_req_t));
+  s_ai_action_result_queue = xQueueCreate(kAiActionQueueDepth, sizeof(ai_action_result_t));
   if (s_state_mutex == NULL || s_i2c_mutex == NULL || s_power_mutex == NULL ||
-      s_ai_mutex == NULL || s_chat_mutex == NULL ||
+      s_ai_mutex == NULL || s_chat_mutex == NULL || s_ai_action_queue_mutex == NULL ||
       s_vision_mutex == NULL ||
-      s_chat_queue == NULL || s_syslog_queue == NULL) {
+      s_chat_queue == NULL || s_syslog_queue == NULL ||
+      s_ai_action_queue == NULL || s_ai_action_result_queue == NULL) {
     rover_log_record_t rec = {
       .level = ESP_LOG_ERROR,
       .component = TAG,
@@ -2246,10 +2676,49 @@ extern "C" void app_main(void) {
   // Unified logger: mirror JSON UART logs to syslog queue.
   rover_log_set_sink(rover_log_syslog_sink, NULL);
 
+  rover_log_record_t rec_pre_m5 = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "boot_before_m5_begin",
+    .fields = NULL,
+    .field_count = 0,
+  };
+  rover_log(&rec_pre_m5);
+
   auto m5cfg = M5.config();
   M5.begin(m5cfg);
+
+  rover_log_record_t rec_post_m5 = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "boot_after_m5_begin",
+    .fields = NULL,
+    .field_count = 0,
+  };
+  rover_log(&rec_post_m5);
+
   M5.Display.setRotation(1);
+
+  rover_log_record_t rec_pre_boot_screen = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "boot_before_draw_status",
+    .fields = NULL,
+    .field_count = 0,
+  };
+  rover_log(&rec_pre_boot_screen);
+
   draw_boot_status("booting...", "");
+
+  rover_log_record_t rec_post_boot_screen = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "boot_after_draw_status",
+    .fields = NULL,
+    .field_count = 0,
+  };
+  rover_log(&rec_post_boot_screen);
+
   esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
   rover_log_field_t wake_fields[] = {
     rover_log_field_str("cause", wakeup_cause_name(wake)),
@@ -2283,36 +2752,6 @@ extern "C" void app_main(void) {
       .field_count = sizeof(fields) / sizeof(fields[0]),
     };
     rover_log(&rec);
-    // Give camera time to be ready, then ping
-    vTaskDelay(pdMS_TO_TICKS(500));
-    char ping_resp[128];
-    xSemaphoreTake(s_vision_mutex, portMAX_DELAY);
-    esp_err_t ping_err =
-        vision_cmd_timeout("PING", "{}", ping_resp, sizeof(ping_resp), kVisionPingTimeoutMs);
-    xSemaphoreGive(s_vision_mutex);
-    if (ping_err == ESP_OK && strstr(ping_resp, "\"ok\":true") != NULL) {
-      s_vision_available = true;
-      rover_log_field_t fields[] = {
-        rover_log_field_str("resp", ping_resp),
-      };
-      rover_log_record_t rec = {
-        .level = ESP_LOG_INFO,
-        .component = TAG,
-        .event = "vision_online_boot_ping",
-        .fields = fields,
-        .field_count = sizeof(fields) / sizeof(fields[0]),
-      };
-      rover_log(&rec);
-    } else {
-      rover_log_record_t rec = {
-        .level = ESP_LOG_WARN,
-        .component = TAG,
-        .event = "vision_not_responding_boot_ping",
-        .fields = NULL,
-        .field_count = 0,
-      };
-      rover_log(&rec);
-    }
   } else {
     rover_log_record_t rec = {
       .level = ESP_LOG_ERROR,
@@ -2328,7 +2767,7 @@ extern "C" void app_main(void) {
   esp_err_t wifi_err = wifi_connect_blocking();
 
   if (wifi_err == ESP_OK) {
-    s_wifi_connected = true;
+    s_wifi_connected.store(true, std::memory_order_relaxed);
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     draw_boot_status("WiFi OK", "init rover...");
 
@@ -2351,10 +2790,12 @@ extern "C" void app_main(void) {
     init_ai();
     start_mdns();
     start_web_server();
-    draw_boot_status("ready", s_vision_available ? "web + chat + cam" : "web + chat online");
+    draw_boot_status("ready",
+                     s_vision_available.load(std::memory_order_relaxed) ? "web + chat + cam"
+                                                                        : "web + chat online");
   } else {
     // Offline fallback — no restart, buttons still work
-    s_wifi_connected = false;
+    s_wifi_connected.store(false, std::memory_order_relaxed);
     rover_log_record_t rec = {
       .level = ESP_LOG_WARN,
       .component = TAG,
