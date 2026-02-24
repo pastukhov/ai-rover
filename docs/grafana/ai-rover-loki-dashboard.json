@@ -99,7 +99,7 @@
             "uid": "${DS_LOKI}"
           },
           "editorMode": "code",
-          "expr": "{hostname=\"$host\", application=\"firmware\"}",
+          "expr": "{application=\"firmware\"}",
           "queryType": "range",
           "refId": "A"
         }
@@ -167,7 +167,7 @@
             "uid": "${DS_LOKI}"
           },
           "editorMode": "code",
-          "expr": "last_over_time({hostname=\"$host\", application=\"firmware\"} | json | event=\"heartbeat\" | unwrap bat_pct [5m])",
+          "expr": "last_over_time({application=\"firmware\"} | json | event=\"heartbeat\" | unwrap fields.bat_pct [5m])",
           "queryType": "range",
           "refId": "A"
         }
@@ -245,7 +245,7 @@
             "uid": "${DS_LOKI}"
           },
           "editorMode": "code",
-          "expr": "last_over_time({hostname=\"$host\", application=\"firmware\"} | json | event=\"heartbeat\" | unwrap bat_pct [1m])",
+          "expr": "last_over_time({application=\"firmware\"} | json | event=\"heartbeat\" | unwrap fields.bat_pct [1m])",
           "legendFormat": "battery",
           "queryType": "range",
           "refId": "A"
@@ -297,7 +297,7 @@
             "uid": "${DS_LOKI}"
           },
           "editorMode": "code",
-          "expr": "sum(count_over_time({hostname=\"$host\", application=\"firmware\"}[1m]))",
+          "expr": "sum(count_over_time({application=\"firmware\"}[1m]))",
           "legendFormat": "lines/min",
           "queryType": "range",
           "refId": "A"
@@ -335,7 +335,7 @@
             "uid": "${DS_LOKI}"
           },
           "editorMode": "code",
-          "expr": "{hostname=\"$host\", application=\"firmware\"} | json | event=\"heartbeat\"",
+          "expr": "{application=\"firmware\"} | json | event=\"heartbeat\"",
           "queryType": "range",
           "refId": "A"
         }
@@ -372,7 +372,7 @@
             "uid": "${DS_LOKI}"
           },
           "editorMode": "code",
-          "expr": "{hostname=\"$host\", application=\"firmware\"} | json | event=~\"tool|button|vision|web_chat|fsm|wifi|ai|boot\"",
+          "expr": "{application=\"firmware\"} | json | event=~\"tool|button|vision|web_chat|fsm|wifi|ai|boot\"",
           "queryType": "range",
           "refId": "A"
         }
@@ -432,7 +432,7 @@
             "uid": "${DS_LOKI}"
           },
           "editorMode": "code",
-          "expr": "sum by (state) (count_over_time({hostname=\"$host\", application=\"firmware\"} | json | event=\"heartbeat\" [5m]))",
+          "expr": "sum by (state) (count_over_time({application=\"firmware\"} | json | event=\"heartbeat\" [5m]))",
           "legendFormat": "{{state}}",
           "queryType": "range",
           "refId": "A"
@@ -487,7 +487,7 @@
             "uid": "${DS_LOKI}"
           },
           "editorMode": "code",
-          "expr": "sum(count_over_time({hostname=\"$host\", application=\"firmware\"}[1m]))",
+          "expr": "sum(count_over_time({application=\"firmware\"}[1m]))",
           "legendFormat": "all logs",
           "queryType": "range",
           "refId": "A"
@@ -498,7 +498,7 @@
             "uid": "${DS_LOKI}"
           },
           "editorMode": "code",
-          "expr": "sum(count_over_time({hostname=\"$host\", application=\"firmware\"} | json | event=\"heartbeat\" [1m]))",
+          "expr": "sum(count_over_time({application=\"firmware\"} | json | event=\"heartbeat\" [1m]))",
           "legendFormat": "heartbeat",
           "queryType": "range",
           "refId": "B"
@@ -509,7 +509,7 @@
             "uid": "${DS_LOKI}"
           },
           "editorMode": "code",
-          "expr": "sum(count_over_time({hostname=\"$host\", application=\"firmware\"} | json | event=\"vision\" [1m]))",
+          "expr": "sum(count_over_time({application=\"firmware\"} | json | event=\"vision\" [1m]))",
           "legendFormat": "vision",
           "queryType": "range",
           "refId": "C"
@@ -528,33 +528,7 @@
     "ai-rover"
   ],
   "templating": {
-    "list": [
-      {
-        "current": {
-          "selected": true,
-          "text": "ai-rover",
-          "value": "ai-rover"
-        },
-        "datasource": {
-          "type": "loki",
-          "uid": "${DS_LOKI}"
-        },
-        "definition": "label_values({application=\"firmware\"}, hostname)",
-        "hide": 0,
-        "includeAll": false,
-        "label": "Host",
-        "multi": false,
-        "name": "host",
-        "options": [],
-        "query": {
-          "query": "label_values({application=\"firmware\"}, hostname)",
-          "refId": "LokiVariableQueryEditor-Host"
-        },
-        "refresh": 1,
-        "sort": 1,
-        "type": "query"
-      }
-    ]
+    "list": []
   },
   "time": {
     "from": "now-15m",
