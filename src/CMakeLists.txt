@@ -1,1 +1,35 @@
-idf_component_register(SRCS "main_idf.cpp" "logger_json.cpp")
+set(ESP_CLAW_ROOT "${CMAKE_CURRENT_LIST_DIR}/../esp-claw")
+
+idf_component_register(
+    SRCS
+        "main_idf.cpp"
+        "cap_ai_rover.cpp"
+        "logger_json.cpp"
+        "ollama.cpp"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_core/src/claw_core.c"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_core/src/claw_task.c"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_core/src/claw_core_llm.c"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_core/src/llm/claw_llm_runtime.c"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_core/src/llm/claw_llm_http_transport.c"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_core/src/llm/backends/claw_llm_backend_anthropic.c"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_core/src/llm/backends/claw_llm_backend_openai_compatible.c"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_core/src/llm/backends/claw_llm_backend_custom.c"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_core/src/llm/media/claw_media_pipeline.c"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_cap/src/claw_cap.c"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_skill/src/claw_skill.c"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_event_router/src/claw_event.c"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_event_router/src/claw_event_router.c"
+    INCLUDE_DIRS
+        "."
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_core/include"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_core/src"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_cap/include"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_skill/include"
+        "${ESP_CLAW_ROOT}/components/claw_modules/claw_event_router/include"
+    REQUIRES
+        esp_timer
+        mbedtls
+        esp_http_client
+        esp-tls
+        json
+        console)

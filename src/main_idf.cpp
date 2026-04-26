@@ -11,8 +11,11 @@
 #include <strings.h>
 
 #include "M5Unified.h"
+#include "cap_ai_rover.h"
 #include "logger_json.h"
 #include "secrets.h"
+#include "claw_cap.h"
+#include "claw_core.h"
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
 #include "driver/uart.h"
@@ -30,7 +33,10 @@
 #include "freertos/task.h"
 #include "mdns.h"
 #include "nvs_flash.h"
-#include "openrouter.h"
+
+#define OLLAMA_HOST "http://192.168.11.66:11434"
+#define OLLAMA_OPENAI_BASE_URL OLLAMA_HOST "/v1"
+#include "ollama.h"
 
 static const char *TAG = "ai-rover-idf";
 
@@ -48,12 +54,28 @@ static const TickType_t kAiActionResultTimeoutSlack = pdMS_TO_TICKS(1000);
 static const TickType_t kAiStopActionTimeout = pdMS_TO_TICKS(7000);
 static const int kAiActionQueueDepth = 4;
 static const int kAiHttpTimeoutMs = 15000;
+static const int kEspClawReceiveTimeoutMs = 130000;
 static const int kAiToolCallMaxIterations = 48;
 static const TickType_t kWifiConnectTimeout = pdMS_TO_TICKS(30000);
 static const TickType_t kInactivitySleepTimeout = pdMS_TO_TICKS(120000);
 static const int WIFI_CONNECTED_BIT = BIT0;
 static const int WIFI_FAIL_BIT = BIT1;
 static const int kWifiMaxRetry = 20;
+
+static const char kAiSystemPrompt[] =
+    "You control a mecanum rover with gripper and a fixed front-facing camera. "
+    "Camera does not pan/tilt; change view only by move() or turn(). "
+    "Use tools directly when user gives a command; do not ask permission first. "
+    "If you say you will scan/look/check, call the tool in the same response. "
+    "Use move() for timed movement, turn() for angle rotation (IMU), stop() for immediate stop. "
+    "Use vision_scan() for fast structured detections (faces/objects). "
+    "Use vision_capture(question=...) for detailed image understanding (scene, colors, text, named objects). "
+    "For named-object search (sofa/couch/divan, chair/armchair, etc.), prefer vision_capture with a targeted question and synonyms. "
+    "When searching, use the returned object presence and approximate frame position (left/center/right, near/far) to decide turning. "
+    "For sweep search, track total rotation and stop after one full 360-degree sweep unless user explicitly asks to continue. "
+    "If the requested object is found, stop turning immediately and report it. "
+    "vision_scan/vision_capture do not provide precise coordinates or distance; avoid endless move-scan loops. "
+    "Respond briefly in the user's language.";
 
 static const gpio_num_t kI2cSdaPin = GPIO_NUM_0;
 static const gpio_num_t kI2cSclPin = GPIO_NUM_26;
@@ -67,6 +89,10 @@ static const uint8_t kGripperOpenAngle = 35;
 static const uint8_t kGripperCloseAngle = 150;
 #define CHAT_PROMPT_MAX 384
 #define CHAT_RESPONSE_MAX 2048
+
+#ifndef AI_ROVER_USE_ESP_CLAW_CORE
+#define AI_ROVER_USE_ESP_CLAW_CORE 0
+#endif
 
 // ── Vision (UnitV-M12) ──
 static const uart_port_t kVisionUart = UART_NUM_1;
@@ -131,8 +157,8 @@ static void send_syslog(const char *message);
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num;
 static int s_syslog_sock = -1;
-static openrouter_handle_t s_ai = NULL;
-static openrouter_handle_t s_ai_vision = NULL;
+static ollama_handle_t s_ai = NULL;
+static ollama_handle_t s_ai_vision = NULL;
 static SemaphoreHandle_t s_state_mutex;
 static SemaphoreHandle_t s_i2c_mutex;
 static SemaphoreHandle_t s_power_mutex;
@@ -144,6 +170,7 @@ static QueueHandle_t s_chat_queue;
 static QueueHandle_t s_syslog_queue;
 static QueueHandle_t s_ai_action_queue;
 static QueueHandle_t s_ai_action_result_queue;
+static std::atomic<bool> s_esp_claw_core_ready{false};
 static uint32_t s_chat_id = 0;
 static uint32_t s_chat_done_id = 0;
 static bool s_chat_pending = false;
@@ -164,6 +191,7 @@ static bool s_gripper_open = false;
 static TickType_t s_web_motion_deadline = 0;
 static std::atomic<uint32_t> s_last_activity_tick{0};
 static std::atomic<uint32_t> s_ai_action_req_seq{0};
+static std::atomic<bool> s_ai_cancel_requested{false};
 
 typedef struct {
   uint32_t id;
@@ -874,6 +902,50 @@ static inline int clamp_int(int v, int lo, int hi) {
 
 static char *cb_vision_capture(const char *fn, const char *arguments, void *ud);
 static void init_ai(void);
+#if AI_ROVER_USE_ESP_CLAW_CORE
+static esp_err_t esp_claw_chat(const char *prompt, char *response, size_t response_size);
+#endif
+
+static inline bool ai_scenario_cancel_requested(void) {
+  return s_ai_cancel_requested.load(std::memory_order_relaxed);
+}
+
+static void request_ai_scenario_cancel(const char *source) {
+  s_ai_cancel_requested.store(true, std::memory_order_relaxed);
+
+  rover_log_field_t fields[] = {
+    rover_log_field_str("source", source ? source : "unknown"),
+  };
+  rover_log_record_t rec = {
+    .level = ESP_LOG_WARN,
+    .component = TAG,
+    .event = "ai_scenario_cancel_requested",
+    .fields = fields,
+    .field_count = sizeof(fields) / sizeof(fields[0]),
+  };
+  rover_log(&rec);
+
+  if (s_ai_action_queue == NULL || s_ai_action_queue_mutex == NULL) return;
+
+  ai_action_req_t stop_req = {
+    .req_id = ++s_ai_action_req_seq,
+    .kind = AI_ACTION_STOP,
+    .x = 0,
+    .y = 0,
+    .z = 0,
+    .duration_ms = 0,
+    .turn_target_deg = 0,
+    .turn_timeout_ms = 0,
+  };
+
+  xSemaphoreTake(s_ai_action_queue_mutex, portMAX_DELAY);
+  if (xQueueSend(s_ai_action_queue, &stop_req, 0) != pdTRUE) {
+    ai_action_req_t dropped = {};
+    (void)xQueueReceive(s_ai_action_queue, &dropped, 0);
+    (void)xQueueSend(s_ai_action_queue, &stop_req, 0);
+  }
+  xSemaphoreGive(s_ai_action_queue_mutex);
+}
 
 static char *make_tool_response(const char *status, const char *action) {
   char buf[96];
@@ -1137,6 +1209,9 @@ static void ai_action_poll_and_execute(void) {
 
 static char *cb_move(const char *fn, const char *arguments, void *ud) {
   (void)fn; (void)ud;
+  if (ai_scenario_cancel_requested()) {
+    return make_tool_response("cancelled", "move");
+  }
   int x = 0, y = 0, z = 0, duration_ms = 1500;
   cJSON *args = cJSON_Parse(arguments ? arguments : "{}");
   if (args) {
@@ -1196,6 +1271,9 @@ static char *cb_move(const char *fn, const char *arguments, void *ud) {
   if (!ai_action_wait_result(req.req_id, wait_timeout, &action_err)) {
     return make_tool_response("timeout", "move");
   }
+  if (ai_scenario_cancel_requested() || action_err == ESP_ERR_INVALID_STATE) {
+    return make_tool_response("cancelled", "move");
+  }
   if (action_err != ESP_OK) {
     return make_tool_response("failed", "move");
   }
@@ -1205,6 +1283,9 @@ static char *cb_move(const char *fn, const char *arguments, void *ud) {
 
 static char *cb_turn(const char *fn, const char *arguments, void *ud) {
   (void)fn; (void)ud;
+  if (ai_scenario_cancel_requested()) {
+    return make_tool_response("cancelled", "turn");
+  }
   const char *direction = "left";
   int angle_deg = 90, speed_pct = 50;
   char dir_buf[8] = "left";
@@ -1279,7 +1360,9 @@ static char *cb_turn(const char *fn, const char *arguments, void *ud) {
   }
 
   const char *status = "failed";
-  if (result.err == ESP_OK) {
+  if (ai_scenario_cancel_requested() || result.err == ESP_ERR_INVALID_STATE) {
+    status = "cancelled";
+  } else if (result.err == ESP_OK) {
     status = "ok";
   } else if (result.err == ESP_ERR_TIMEOUT) {
     status = "timeout";
@@ -1294,6 +1377,7 @@ static char *cb_turn(const char *fn, const char *arguments, void *ud) {
 
 static char *cb_stop(const char *fn, const char *arguments, void *ud) {
   (void)fn; (void)arguments; (void)ud;
+  request_ai_scenario_cancel("tool_stop");
   mark_activity();
   rover_log_record_t rec = {
     .level = ESP_LOG_INFO,
@@ -1340,6 +1424,9 @@ static char *cb_stop(const char *fn, const char *arguments, void *ud) {
 
 static char *cb_gripper_open(const char *fn, const char *arguments, void *ud) {
   (void)fn; (void)arguments; (void)ud;
+  if (ai_scenario_cancel_requested()) {
+    return make_tool_response("cancelled", "gripper_open");
+  }
   mark_activity();
   if (s_ai_action_queue == NULL) {
     return make_tool_response("unavailable", "gripper_open");
@@ -1383,6 +1470,9 @@ static char *cb_gripper_open(const char *fn, const char *arguments, void *ud) {
 
 static char *cb_gripper_close(const char *fn, const char *arguments, void *ud) {
   (void)fn; (void)arguments; (void)ud;
+  if (ai_scenario_cancel_requested()) {
+    return make_tool_response("cancelled", "gripper_close");
+  }
   mark_activity();
   if (s_ai_action_queue == NULL) {
     return make_tool_response("unavailable", "gripper_close");
@@ -1426,6 +1516,9 @@ static char *cb_gripper_close(const char *fn, const char *arguments, void *ud) {
 
 static char *cb_read_imu(const char *fn, const char *arguments, void *ud) {
   (void)fn; (void)arguments; (void)ud;
+  if (ai_scenario_cancel_requested()) {
+    return make_tool_response("cancelled", "read_imu");
+  }
   if (!M5.Imu.isEnabled()) {
     return make_tool_response("imu_unavailable", "read_imu");
   }
@@ -1445,6 +1538,9 @@ static char *cb_read_imu(const char *fn, const char *arguments, void *ud) {
 
 static char *cb_vision_scan(const char *fn, const char *arguments, void *ud) {
   (void)fn; (void)ud;
+  if (ai_scenario_cancel_requested()) {
+    return make_tool_response("cancelled", "vision_scan");
+  }
   const char *mode = "RELIABLE";
   cJSON *args = cJSON_Parse(arguments ? arguments : "{}");
   if (args) {
@@ -1541,6 +1637,9 @@ static char *cb_vision_scan(const char *fn, const char *arguments, void *ud) {
 
 static char *cb_vision_capture(const char *fn, const char *arguments, void *ud) {
   (void)fn; (void)ud;
+  if (ai_scenario_cancel_requested()) {
+    return make_tool_response("cancelled", "vision_capture");
+  }
 
   int quality = kCaptureDefaultQuality;
   char question[240] = "Describe what is visible in this rover camera image. Be concise and concrete.";
@@ -1654,7 +1753,7 @@ static char *cb_vision_capture(const char *fn, const char *arguments, void *ud) 
   char mm_resp[CHAT_RESPONSE_MAX];
   mm_resp[0] = '\0';
   xSemaphoreTake(s_ai_vision_mutex, portMAX_DELAY);
-  esp_err_t mm_err = openrouter_call_with_image_data(
+  esp_err_t mm_err = ollama_call_with_image_data(
       s_ai_vision, vision_prompt, jpeg, jpeg_size, mm_resp, sizeof(mm_resp));
   xSemaphoreGive(s_ai_vision_mutex);
   free(jpeg);
@@ -1704,6 +1803,140 @@ static char *cb_vision_capture(const char *fn, const char *arguments, void *ud) 
   return payload ? payload : make_tool_response("memory_error", "vision_capture");
 }
 
+static void init_esp_claw_capabilities(void) {
+  static bool initialized = false;
+  if (initialized) {
+    return;
+  }
+
+  esp_err_t err = claw_cap_init();
+  if (err == ESP_OK) {
+    const cap_ai_rover_callbacks_t callbacks = {
+      .move = cb_move,
+      .turn = cb_turn,
+      .stop = cb_stop,
+      .gripper_open = cb_gripper_open,
+      .gripper_close = cb_gripper_close,
+      .read_imu = cb_read_imu,
+      .vision_scan = cb_vision_scan,
+      .vision_capture = cb_vision_capture,
+    };
+    err = cap_ai_rover_register_group(&callbacks);
+  }
+  if (err == ESP_OK) {
+    static const char *const visible_groups[] = {"cap_ai_rover"};
+    err = claw_cap_set_llm_visible_groups(visible_groups, sizeof(visible_groups) / sizeof(visible_groups[0]));
+  }
+#if AI_ROVER_USE_ESP_CLAW_CORE
+  if (err == ESP_OK) {
+    claw_core_config_t core_config = {};
+    core_config.api_key = "ollama";
+    core_config.backend_type = "openai_compatible";
+    core_config.profile = "qwen_compatible";
+    core_config.model = "qwen2.5vl:7b";
+    core_config.base_url = OLLAMA_OPENAI_BASE_URL;
+    core_config.auth_type = "none";
+    core_config.timeout_ms = kAiHttpTimeoutMs;
+    core_config.system_prompt = kAiSystemPrompt;
+    core_config.call_cap = claw_cap_call_from_core;
+    core_config.task_stack_size = 16 * 1024;
+    core_config.task_priority = 5;
+    core_config.task_core = tskNO_AFFINITY;
+    core_config.max_tool_iterations = kAiToolCallMaxIterations;
+    core_config.request_queue_len = 2;
+    core_config.response_queue_len = 2;
+    core_config.max_context_providers = 1;
+
+    err = claw_core_init(&core_config);
+    if (err == ESP_OK) {
+      err = claw_core_add_context_provider(&claw_cap_tools_provider);
+    }
+    if (err == ESP_OK) {
+      err = claw_core_start();
+    }
+    if (err == ESP_OK) {
+      s_esp_claw_core_ready.store(true, std::memory_order_relaxed);
+    }
+  }
+#endif
+  if (err == ESP_OK) {
+    initialized = true;
+    rover_log_record_t rec = {
+      .level = ESP_LOG_INFO,
+      .component = TAG,
+      .event = "esp_claw_cap_ai_rover_ready",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec);
+  } else {
+    rover_log_field_t fields[] = {
+      rover_log_field_str("err", esp_err_to_name(err)),
+    };
+    rover_log_record_t rec = {
+      .level = ESP_LOG_WARN,
+      .component = TAG,
+      .event = "esp_claw_cap_ai_rover_failed",
+      .fields = fields,
+      .field_count = sizeof(fields) / sizeof(fields[0]),
+    };
+    rover_log(&rec);
+  }
+}
+
+#if AI_ROVER_USE_ESP_CLAW_CORE
+static esp_err_t esp_claw_chat(const char *prompt, char *response, size_t response_size) {
+  static std::atomic<uint32_t> s_esp_claw_request_seq{0};
+  if (prompt == NULL || response == NULL || response_size == 0) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  response[0] = '\0';
+  if (!s_esp_claw_core_ready.load(std::memory_order_relaxed)) {
+    strlcpy(response, "ESP-Claw core unavailable", response_size);
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  uint32_t request_id = ++s_esp_claw_request_seq;
+  claw_core_request_t request = {
+    .request_id = request_id,
+    .flags = 0,
+    .session_id = "web",
+    .user_text = prompt,
+    .source_channel = "web",
+    .source_chat_id = "local",
+    .source_sender_id = "user",
+    .source_message_id = NULL,
+    .source_cap = "ai_rover_web",
+    .target_channel = "web",
+    .target_chat_id = "local",
+  };
+  esp_err_t err = claw_core_submit(&request, 1000);
+  if (err != ESP_OK) {
+    snprintf(response, response_size, "ESP-Claw submit failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  claw_core_response_t core_response = {};
+  err = claw_core_receive_for(request_id, &core_response, kEspClawReceiveTimeoutMs);
+  if (err != ESP_OK) {
+    snprintf(response, response_size, "ESP-Claw receive failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  if (core_response.status == CLAW_CORE_RESPONSE_STATUS_OK) {
+    strlcpy(response, core_response.text ? core_response.text : "", response_size);
+    err = ESP_OK;
+  } else {
+    strlcpy(response,
+            core_response.error_message ? core_response.error_message : "ESP-Claw request failed",
+            response_size);
+    err = ESP_FAIL;
+  }
+  claw_core_response_free(&core_response);
+  return err;
+}
+#endif
+
 static void chat_worker_task(void *arg) {
   (void)arg;
   chat_job_t job;
@@ -1727,15 +1960,28 @@ static void chat_worker_task(void *arg) {
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     transition_to(STATE_AI_THINKING);
     xSemaphoreGive(s_state_mutex);
+    s_ai_cancel_requested.store(false, std::memory_order_relaxed);
 
+#if AI_ROVER_USE_ESP_CLAW_CORE
+    if (!s_esp_claw_core_ready.load(std::memory_order_relaxed)) {
+#else
     if (s_ai == NULL) {
+#endif
       err = ESP_ERR_INVALID_STATE;
       strlcpy(response, "AI unavailable", sizeof(response));
     } else {
+#if AI_ROVER_USE_ESP_CLAW_CORE
+      err = esp_claw_chat(job.prompt, response, sizeof(response));
+#else
       xSemaphoreTake(s_ai_mutex, portMAX_DELAY);
-      err = openrouter_call_with_tools(
+      err = ollama_call_with_tools(
           s_ai, job.prompt, response, sizeof(response), kAiToolCallMaxIterations);
       xSemaphoreGive(s_ai_mutex);
+#endif
+    }
+    if (ai_scenario_cancel_requested()) {
+      err = ESP_ERR_INVALID_STATE;
+      strlcpy(response, "Cancelled by STOP", sizeof(response));
     }
 
     // Safety: on AI error, stop motors
@@ -2065,6 +2311,9 @@ static esp_err_t handle_cmd(httpd_req_t *req) {
   if (action[0] == '\0') {
     strlcpy(action, "stop", sizeof(action));
   }
+  if (strcmp(action, "stop") == 0) {
+    request_ai_scenario_cancel("web_stop");
+  }
 
   xSemaphoreTake(s_state_mutex, portMAX_DELAY);
 
@@ -2127,7 +2376,12 @@ static esp_err_t handle_chat(httpd_req_t *req) {
     httpd_resp_set_status(req, "400 Bad Request");
     return httpd_resp_send(req, "{\"ok\":false,\"error\":\"missing msg\"}", HTTPD_RESP_USE_STRLEN);
   }
+  s_ai_cancel_requested.store(false, std::memory_order_relaxed);
+#if AI_ROVER_USE_ESP_CLAW_CORE
+  if (!s_esp_claw_core_ready.load(std::memory_order_relaxed) && s_wifi_connected.load(std::memory_order_relaxed)) {
+#else
   if (s_ai == NULL && s_wifi_connected.load(std::memory_order_relaxed)) {
+#endif
     rover_log_record_t rec = {
       .level = ESP_LOG_WARN,
       .component = TAG,
@@ -2137,12 +2391,20 @@ static esp_err_t handle_chat(httpd_req_t *req) {
     };
     rover_log(&rec);
     if (s_ai_mutex != NULL) xSemaphoreTake(s_ai_mutex, portMAX_DELAY);
+#if AI_ROVER_USE_ESP_CLAW_CORE
+    if (!s_esp_claw_core_ready.load(std::memory_order_relaxed)) {
+#else
     if (s_ai == NULL) {
+#endif
       init_ai();
     }
     if (s_ai_mutex != NULL) xSemaphoreGive(s_ai_mutex);
   }
+#if AI_ROVER_USE_ESP_CLAW_CORE
+  if (!s_esp_claw_core_ready.load(std::memory_order_relaxed) || s_chat_queue == NULL) {
+#else
   if (s_ai == NULL || s_chat_queue == NULL) {
+#endif
     rover_log_record_t rec = {
       .level = ESP_LOG_ERROR,
       .component = TAG,
@@ -2283,26 +2545,28 @@ static void start_web_server(void) {
 }
 
 static void init_ai(void) {
+  init_esp_claw_capabilities();
+
   static const char *kTurnDirEnum[] = {"left", "right", NULL};
-  static const openrouter_param_t kVisionCaptureParams[] = {
+  static const ollama_param_t kVisionCaptureParams[] = {
       {"question", "string", "What to inspect in the camera image (optional).", false, NULL},
       {"quality", "number", "JPEG quality 30..95 (optional, default 75).", false, NULL},
       {NULL, NULL, NULL, false, NULL},
   };
-  static const openrouter_param_t kMoveParams[] = {
+  static const ollama_param_t kMoveParams[] = {
       {"x", "number", "Lateral speed -100..100 (left negative)", true, NULL},
       {"y", "number", "Forward speed -100..100 (back negative)", true, NULL},
       {"z", "number", "Rotation speed -100..100", false, NULL},
       {"duration_ms", "number", "Move duration ms (100-5000, default 1500)", false, NULL},
       {NULL, NULL, NULL, false, NULL},
   };
-  static const openrouter_param_t kTurnParams[] = {
+  static const ollama_param_t kTurnParams[] = {
       {"direction", "string", "Turn direction", true, kTurnDirEnum},
       {"angle_deg", "number", "Target angle in degrees (5-360)", false, NULL},
       {"speed_percent", "number", "Rotation speed percent (20-100)", false, NULL},
       {NULL, NULL, NULL, false, NULL},
   };
-  static const openrouter_simple_function_t kTools[] = {
+  static const ollama_simple_function_t kTools[] = {
       {"move", "Move the rover for duration_ms, then stop.", kMoveParams, cb_move, NULL},
       {"turn", "Rotate the rover in place by angle_deg using IMU gyroscope feedback.", kTurnParams, cb_turn, NULL},
       {"stop", "Stop all rover motion immediately.", NULL, cb_stop, NULL},
@@ -2313,33 +2577,18 @@ static void init_ai(void) {
       {"vision_capture", "Capture a camera image and analyze it with a vision model. Use for detailed visual questions.", kVisionCaptureParams, cb_vision_capture, NULL},
   };
 
-  openrouter_config_t cfg = {};
-  cfg.api_key = OPENROUTER_API_KEY;
-  cfg.enable_streaming = false;
+  ollama_config_t cfg = {};
+  cfg.model = "qwen2.5vl:7b";
   cfg.enable_tools = true;
-  cfg.http_timeout_ms = kAiHttpTimeoutMs;
+  cfg.timeout_ms = kAiHttpTimeoutMs;
   cfg.max_tokens = 256;
-  cfg.default_model = "openai/gpt-4o-mini";
-  cfg.default_system_role =
-      "You control a mecanum rover with gripper and a fixed front-facing camera. "
-      "Camera does not pan/tilt; change view only by move() or turn(). "
-      "Use tools directly when user gives a command; do not ask permission first. "
-      "If you say you will scan/look/check, call the tool in the same response. "
-      "Use move() for timed movement, turn() for angle rotation (IMU), stop() for immediate stop. "
-      "Use vision_scan() for fast structured detections (faces/objects). "
-      "Use vision_capture(question=...) for detailed image understanding (scene, colors, text, named objects). "
-      "For named-object search (sofa/couch/divan, chair/armchair, etc.), prefer vision_capture with a targeted question and synonyms. "
-      "When searching, use the returned object presence and approximate frame position (left/center/right, near/far) to decide turning. "
-      "For sweep search, track total rotation and stop after one full 360-degree sweep unless user explicitly asks to continue. "
-      "If the requested object is found, stop turning immediately and report it. "
-      "vision_scan/vision_capture do not provide precise coordinates or distance; avoid endless move-scan loops. "
-      "Respond briefly in the user's language.";
-  s_ai = openrouter_create(&cfg);
+  cfg.system_role = kAiSystemPrompt;
+  s_ai = ollama_create(&cfg);
   if (s_ai == NULL) {
     rover_log_record_t rec1 = {
       .level = ESP_LOG_ERROR,
       .component = TAG,
-      .event = "ai_openrouter_init_failed",
+      .event = "ai_ollama_init_failed",
       .fields = NULL,
       .field_count = 0,
     };
@@ -2355,14 +2604,14 @@ static void init_ai(void) {
     return;
   }
 
-  openrouter_config_t vision_cfg = cfg;
+  ollama_config_t vision_cfg = cfg;
   vision_cfg.enable_tools = false;
   vision_cfg.max_tokens = 192;
-  vision_cfg.default_system_role =
+  vision_cfg.system_role =
       "You analyze rover camera images. "
       "Answer the user's question using the image. "
       "Be concise, concrete, and avoid speculation.";
-  s_ai_vision = openrouter_create(&vision_cfg);
+  s_ai_vision = ollama_create(&vision_cfg);
   if (s_ai_vision == NULL) {
     rover_log_record_t rec = {
       .level = ESP_LOG_WARN,
@@ -2376,7 +2625,7 @@ static void init_ai(void) {
 
   esp_err_t reg_err = ESP_OK;
   for (size_t i = 0; i < sizeof(kTools) / sizeof(kTools[0]) && reg_err == ESP_OK; i++) {
-    reg_err = openrouter_register_simple_function(s_ai, &kTools[i]);
+    reg_err = ollama_register_simple_function(s_ai, &kTools[i]);
   }
   if (reg_err != ESP_OK) {
     rover_log_field_t fields[] = {
