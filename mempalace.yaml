@@ -1,0 +1,30 @@
+wing: ai_rover
+rooms:
+- name: scripts
+  description: Files from tools/
+  keywords:
+  - scripts
+  - tools
+- name: documentation
+  description: Files from docs/
+  keywords:
+  - documentation
+  - docs
+- name: include
+  description: Files from include/
+  keywords:
+  - include
+  - include
+- name: managed_components
+  description: Files from managed_components/
+  keywords:
+  - managed_components
+  - managed_components
+- name: src
+  description: Files from src/
+  keywords:
+  - src
+  - src
+- name: general
+  description: Files that don't fit other rooms
+  keywords: []
