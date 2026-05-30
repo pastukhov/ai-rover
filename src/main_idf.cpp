@@ -11,14 +11,14 @@
 #include <strings.h>
 
 #include "M5Unified.h"
+#include "cJSON.h"
 #include "logger_json.h"
-#include "secrets.h"
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
-#include "driver/uart.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
@@ -41,7 +41,6 @@ static const int kSyslogPort = 514;
 static const size_t kSyslogMsgMax = 512;
 static const size_t kSyslogPayloadMax = 640;
 static const TickType_t kHeartbeatPeriod = pdMS_TO_TICKS(1000);
-static const TickType_t kVisionPingPeriod = pdMS_TO_TICKS(10000);
 static const TickType_t kLoopPeriod = pdMS_TO_TICKS(20);
 static const TickType_t kAiActionQueueSendTimeout = pdMS_TO_TICKS(100);
 static const TickType_t kAiActionResultTimeoutSlack = pdMS_TO_TICKS(1000);
@@ -54,6 +53,18 @@ static const TickType_t kInactivitySleepTimeout = pdMS_TO_TICKS(120000);
 static const int WIFI_CONNECTED_BIT = BIT0;
 static const int WIFI_FAIL_BIT = BIT1;
 static const int kWifiMaxRetry = 20;
+static const int kWifiApMaxClients = 2;
+static const char *kSettingsNamespace = "rover_cfg";
+static const char *kDefaultLlmModel = "openai/gpt-4o-mini";
+static const char *kDefaultLlmEndpoint = "";
+
+typedef struct {
+  char wifi_ssid[33];
+  char wifi_password[65];
+  char llm_endpoint[256];
+  char llm_api_key[257];
+  char llm_model[128];
+} rover_settings_t;
 
 static const gpio_num_t kI2cSdaPin = GPIO_NUM_0;
 static const gpio_num_t kI2cSclPin = GPIO_NUM_26;
@@ -67,22 +78,6 @@ static const uint8_t kGripperOpenAngle = 35;
 static const uint8_t kGripperCloseAngle = 150;
 #define CHAT_PROMPT_MAX 384
 #define CHAT_RESPONSE_MAX 2048
-
-// ── Vision (UnitV-M12) ──
-static const uart_port_t kVisionUart = UART_NUM_1;
-static const gpio_num_t kVisionTxPin = GPIO_NUM_32;
-static const gpio_num_t kVisionRxPin = GPIO_NUM_33;
-static const int kVisionBaud = 115200;
-static const int kVisionRxBuf = 2048;
-static const int kVisionTimeoutMs = 7000;
-static const int kVisionPingTimeoutMs = 500;
-static const int kVisionCaptureTimeoutMs = 12000;
-static const int kCaptureMaxJpegBytes = 40960;   // 40KB K210 limit
-static const int kCaptureDefaultQuality = 75;
-static const int kCaptureChunkSize = 2048;
-static const int kVisionCaptureRetryCount = 3;
-static const TickType_t kVisionCaptureRetryDelay = pdMS_TO_TICKS(150);
-#define VISION_RESP_MAX 512
 
 // ── Rover FSM ──
 typedef enum {
@@ -132,18 +127,19 @@ static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num;
 static int s_syslog_sock = -1;
 static openrouter_handle_t s_ai = NULL;
-static openrouter_handle_t s_ai_vision = NULL;
 static SemaphoreHandle_t s_state_mutex;
 static SemaphoreHandle_t s_i2c_mutex;
 static SemaphoreHandle_t s_power_mutex;
 static SemaphoreHandle_t s_ai_mutex;
-static SemaphoreHandle_t s_ai_vision_mutex;
+static SemaphoreHandle_t s_settings_mutex;
 static SemaphoreHandle_t s_chat_mutex;
 static SemaphoreHandle_t s_ai_action_queue_mutex;
 static QueueHandle_t s_chat_queue;
 static QueueHandle_t s_syslog_queue;
 static QueueHandle_t s_ai_action_queue;
 static QueueHandle_t s_ai_action_result_queue;
+static esp_netif_t *s_wifi_sta_netif = NULL;
+static esp_netif_t *s_wifi_ap_netif = NULL;
 static uint32_t s_chat_id = 0;
 static uint32_t s_chat_done_id = 0;
 static bool s_chat_pending = false;
@@ -151,10 +147,12 @@ static esp_err_t s_chat_result_err = ESP_OK;
 static char s_chat_response[CHAT_RESPONSE_MAX];
 // Cross-core status flags: use atomics for lock-free reads in UI/tasks.
 static std::atomic<bool> s_wifi_connected{false};
+static std::atomic<bool> s_wifi_ap_active{false};
+static char s_wifi_ap_ssid[33];
+static rover_settings_t s_settings;
 static httpd_handle_t s_httpd = NULL;
-static SemaphoreHandle_t s_vision_mutex;
-static uint32_t s_vision_req_id = 0;
-static std::atomic<bool> s_vision_available{false};
+static bool s_wifi_stack_initialized = false;
+static bool s_wifi_started = false;
 
 static int8_t s_motion_x = 0;
 static int8_t s_motion_y = 0;
@@ -195,6 +193,144 @@ typedef struct {
   float turn_measured_deg;
 } ai_action_result_t;
 
+static const char *wifi_authmode_name(wifi_auth_mode_t authmode) {
+  switch (authmode) {
+    case WIFI_AUTH_OPEN: return "open";
+    case WIFI_AUTH_WEP: return "wep";
+    case WIFI_AUTH_WPA_PSK: return "wpa_psk";
+    case WIFI_AUTH_WPA2_PSK: return "wpa2_psk";
+    case WIFI_AUTH_WPA_WPA2_PSK: return "wpa_wpa2_psk";
+#if CONFIG_ESP_WIFI_ENABLE_WPA3_SAE
+    case WIFI_AUTH_WPA3_PSK: return "wpa3_psk";
+    case WIFI_AUTH_WPA2_WPA3_PSK: return "wpa2_wpa3_psk";
+#endif
+    default: return "unknown";
+  }
+}
+
+static void settings_set_defaults(rover_settings_t *settings) {
+  memset(settings, 0, sizeof(*settings));
+  strlcpy(settings->llm_model, kDefaultLlmModel, sizeof(settings->llm_model));
+  strlcpy(settings->llm_endpoint, kDefaultLlmEndpoint, sizeof(settings->llm_endpoint));
+}
+
+static void settings_copy_if_present(char *dst, size_t dst_size, const cJSON *item) {
+  if (!cJSON_IsString(item) || item->valuestring == NULL) {
+    return;
+  }
+  if (item->valuestring[0] == '\0') {
+    return;
+  }
+  strlcpy(dst, item->valuestring, dst_size);
+}
+
+static esp_err_t settings_load_from_nvs(rover_settings_t *settings) {
+  settings_set_defaults(settings);
+
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open(kSettingsNamespace, NVS_READONLY, &handle);
+  if (err != ESP_OK) {
+    return ESP_OK;
+  }
+
+  size_t len = sizeof(settings->wifi_ssid);
+  err = nvs_get_str(handle, "wifi_ssid", settings->wifi_ssid, &len);
+  if (err != ESP_OK) settings->wifi_ssid[0] = '\0';
+
+  len = sizeof(settings->wifi_password);
+  err = nvs_get_str(handle, "wifi_password", settings->wifi_password, &len);
+  if (err != ESP_OK) settings->wifi_password[0] = '\0';
+
+  len = sizeof(settings->llm_endpoint);
+  err = nvs_get_str(handle, "llm_endpoint", settings->llm_endpoint, &len);
+  if (err != ESP_OK) strlcpy(settings->llm_endpoint, kDefaultLlmEndpoint, sizeof(settings->llm_endpoint));
+
+  len = sizeof(settings->llm_api_key);
+  err = nvs_get_str(handle, "llm_api_key", settings->llm_api_key, &len);
+  if (err != ESP_OK) settings->llm_api_key[0] = '\0';
+
+  len = sizeof(settings->llm_model);
+  err = nvs_get_str(handle, "llm_model", settings->llm_model, &len);
+  if (err != ESP_OK) strlcpy(settings->llm_model, kDefaultLlmModel, sizeof(settings->llm_model));
+
+  nvs_close(handle);
+  return ESP_OK;
+}
+
+static esp_err_t settings_save_to_nvs(const rover_settings_t *settings) {
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open(kSettingsNamespace, NVS_READWRITE, &handle);
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  err = nvs_set_str(handle, "wifi_ssid", settings->wifi_ssid);
+  if (err == ESP_OK) err = nvs_set_str(handle, "wifi_password", settings->wifi_password);
+  if (err == ESP_OK) err = nvs_set_str(handle, "llm_endpoint", settings->llm_endpoint);
+  if (err == ESP_OK) err = nvs_set_str(handle, "llm_api_key", settings->llm_api_key);
+  if (err == ESP_OK) err = nvs_set_str(handle, "llm_model", settings->llm_model);
+  if (err == ESP_OK) err = nvs_commit(handle);
+
+  nvs_close(handle);
+  return err;
+}
+
+static esp_err_t settings_erase_nvs(void) {
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open(kSettingsNamespace, NVS_READWRITE, &handle);
+  if (err != ESP_OK) {
+    return err;
+  }
+  err = nvs_erase_all(handle);
+  if (err == ESP_OK) err = nvs_commit(handle);
+  nvs_close(handle);
+  return err;
+}
+
+static esp_err_t settings_init_from_nvs(void) {
+  if (s_settings_mutex == NULL) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  rover_settings_t loaded = {};
+  esp_err_t err = settings_load_from_nvs(&loaded);
+  if (err != ESP_OK) {
+    return err;
+  }
+  xSemaphoreTake(s_settings_mutex, portMAX_DELAY);
+  s_settings = loaded;
+  xSemaphoreGive(s_settings_mutex);
+  return ESP_OK;
+}
+
+static void settings_snapshot(rover_settings_t *out) {
+  xSemaphoreTake(s_settings_mutex, portMAX_DELAY);
+  *out = s_settings;
+  xSemaphoreGive(s_settings_mutex);
+}
+
+static void settings_apply_snapshot(const rover_settings_t *in) {
+  xSemaphoreTake(s_settings_mutex, portMAX_DELAY);
+  s_settings = *in;
+  xSemaphoreGive(s_settings_mutex);
+}
+
+static bool settings_wifi_configured(const rover_settings_t *settings) {
+  return settings->wifi_ssid[0] != '\0';
+}
+
+static bool settings_llm_configured(const rover_settings_t *settings) {
+  return settings->llm_api_key[0] != '\0';
+}
+
+static void destroy_ai_handles(void) {
+  if (s_ai != NULL) {
+    openrouter_destroy(s_ai);
+    s_ai = NULL;
+  }
+}
+
+static void reload_ai_from_settings(void);
+
 static void wifi_event_handler(void *arg,
                                esp_event_base_t event_base,
                                int32_t event_id,
@@ -202,7 +338,11 @@ static void wifi_event_handler(void *arg,
   (void)arg;
   (void)event_data;
   if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-    esp_wifi_connect();
+    rover_settings_t settings = {};
+    settings_snapshot(&settings);
+    if (settings_wifi_configured(&settings)) {
+      esp_wifi_connect();
+    }
     return;
   }
 
@@ -229,29 +369,179 @@ static void wifi_event_handler(void *arg,
       };
       rover_log(&rec);
     } else {
-      xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+      if (s_wifi_event_group != NULL) {
+        xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+      }
     }
     return;
   }
 
   if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
     s_retry_num = 0;
-    xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    if (s_wifi_event_group != NULL) {
+      xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+  }
+}
+
+static void format_wifi_ap_ssid(char *buf, size_t len) {
+  uint8_t mac[6] = {};
+  if (esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP) == ESP_OK) {
+    snprintf(buf, len, "AI-Rover-%02X%02X", mac[4], mac[5]);
+  } else {
+    strlcpy(buf, "AI-Rover-AP", len);
+  }
+}
+
+static esp_err_t ensure_wifi_stack_initialized(void) {
+  if (s_wifi_stack_initialized) {
+    return ESP_OK;
+  }
+
+  esp_err_t err = esp_netif_init();
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    return err;
+  }
+
+  err = esp_event_loop_create_default();
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    return err;
+  }
+
+  if (s_wifi_sta_netif == NULL) {
+    s_wifi_sta_netif = esp_netif_create_default_wifi_sta();
+    if (s_wifi_sta_netif == NULL) {
+      return ESP_ERR_NO_MEM;
+    }
+  }
+
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  err = esp_wifi_init(&cfg);
+  if (err != ESP_OK && err != ESP_ERR_WIFI_INIT_STATE) {
+    return err;
+  }
+
+  s_wifi_stack_initialized = true;
+  return ESP_OK;
+}
+
+static esp_err_t ensure_wifi_started(void) {
+  if (s_wifi_started) {
+    return ESP_OK;
+  }
+
+  esp_err_t err = esp_wifi_start();
+  if (err == ESP_OK || err == ESP_ERR_WIFI_CONN) {
+    s_wifi_started = true;
+    return ESP_OK;
+  }
+  return err;
+}
+
+static esp_err_t start_wifi_ap_fallback(void) {
+  if (s_wifi_ap_active.load(std::memory_order_relaxed)) {
+    return ESP_OK;
+  }
+
+  esp_err_t err = ensure_wifi_stack_initialized();
+  if (err != ESP_OK) return err;
+
+  if (s_wifi_ap_netif == NULL) {
+    s_wifi_ap_netif = esp_netif_create_default_wifi_ap();
+    if (s_wifi_ap_netif == NULL) {
+      return ESP_ERR_NO_MEM;
+    }
+  }
+
+  format_wifi_ap_ssid(s_wifi_ap_ssid, sizeof(s_wifi_ap_ssid));
+
+  wifi_config_t ap_config = {};
+  strlcpy((char *)ap_config.ap.ssid, s_wifi_ap_ssid, sizeof(ap_config.ap.ssid));
+  ap_config.ap.ssid_len = strlen(s_wifi_ap_ssid);
+  ap_config.ap.authmode = WIFI_AUTH_OPEN;
+  ap_config.ap.max_connection = kWifiApMaxClients;
+  ap_config.ap.channel = 6;
+
+  wifi_mode_t mode = WIFI_MODE_APSTA;
+  err = esp_wifi_set_mode(mode);
+  if (err != ESP_OK) return err;
+  err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+  if (err != ESP_OK) return err;
+  err = ensure_wifi_started();
+  if (err != ESP_OK) return err;
+
+  s_wifi_ap_active.store(true, std::memory_order_relaxed);
+  rover_log_field_t fields[] = {
+    rover_log_field_str("ssid", s_wifi_ap_ssid),
+    rover_log_field_str("mode", "apsta"),
+    rover_log_field_int("max_clients", kWifiApMaxClients),
+  };
+  rover_log_record_t rec = {
+    .level = ESP_LOG_WARN,
+    .component = TAG,
+    .event = "wifi_ap_started",
+    .fields = fields,
+    .field_count = sizeof(fields) / sizeof(fields[0]),
+  };
+  rover_log(&rec);
+  return ESP_OK;
+}
+
+static void stop_wifi_ap_fallback(void) {
+  if (!s_wifi_ap_active.load(std::memory_order_relaxed)) {
+    return;
+  }
+
+  esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+  if (err == ESP_OK) {
+    s_wifi_ap_active.store(false, std::memory_order_relaxed);
+    rover_log_record_t rec = {
+      .level = ESP_LOG_INFO,
+      .component = TAG,
+      .event = "wifi_ap_stopped",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec);
+  } else {
+    rover_log_field_t fields[] = {
+      rover_log_field_str("err", esp_err_to_name(err)),
+    };
+    rover_log_record_t rec = {
+      .level = ESP_LOG_WARN,
+      .component = TAG,
+      .event = "wifi_ap_stop_failed",
+      .fields = fields,
+      .field_count = sizeof(fields) / sizeof(fields[0]),
+    };
+    rover_log(&rec);
   }
 }
 
 static esp_err_t wifi_connect_blocking(void) {
+  esp_err_t err = ensure_wifi_stack_initialized();
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  rover_settings_t settings = {};
+  settings_snapshot(&settings);
+  if (!settings_wifi_configured(&settings)) {
+    rover_log_record_t rec = {
+      .level = ESP_LOG_WARN,
+      .component = TAG,
+      .event = "wifi_credentials_missing",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec);
+    return ESP_ERR_NOT_FOUND;
+  }
+
   s_wifi_event_group = xEventGroupCreate();
   if (s_wifi_event_group == NULL) {
     return ESP_ERR_NO_MEM;
   }
-
-  ESP_ERROR_CHECK(esp_netif_init());
-  ESP_ERROR_CHECK(esp_event_loop_create_default());
-  esp_netif_create_default_wifi_sta();
-
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
   esp_event_handler_instance_t instance_any_id;
   esp_event_handler_instance_t instance_got_ip;
@@ -261,15 +551,16 @@ static esp_err_t wifi_connect_blocking(void) {
       IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
 
   wifi_config_t wifi_config = {};
-  strncpy((char *)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
-  strncpy((char *)wifi_config.sta.password, WIFI_PASSWORD, sizeof(wifi_config.sta.password) - 1);
+  strncpy((char *)wifi_config.sta.ssid, settings.wifi_ssid, sizeof(wifi_config.sta.ssid) - 1);
+  strncpy((char *)wifi_config.sta.password, settings.wifi_password, sizeof(wifi_config.sta.password) - 1);
   wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
   wifi_config.sta.pmf_cfg.capable = true;
   wifi_config.sta.pmf_cfg.required = false;
 
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+  ESP_ERROR_CHECK(esp_wifi_set_mode(s_wifi_ap_active.load(std::memory_order_relaxed) ? WIFI_MODE_APSTA : WIFI_MODE_STA));
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-  ESP_ERROR_CHECK(esp_wifi_start());
+  ESP_ERROR_CHECK(ensure_wifi_started());
+  (void)esp_wifi_connect();
 
   EventBits_t bits = xEventGroupWaitBits(
       s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, kWifiConnectTimeout);
@@ -280,7 +571,7 @@ static esp_err_t wifi_connect_blocking(void) {
   vEventGroupDelete(s_wifi_event_group);
 
   if (bits & WIFI_CONNECTED_BIT) {
-    rover_log_field_t fields[] = { rover_log_field_str("ssid", WIFI_SSID) };
+    rover_log_field_t fields[] = { rover_log_field_str("ssid", settings.wifi_ssid) };
     rover_log_record_t rec = {
       .level = ESP_LOG_INFO,
       .component = TAG,
@@ -551,161 +842,6 @@ static void rover_emergency_stop(void) {
   (void)rover_set_speed(0, 0, 0);
 }
 
-// ── Vision UART (UnitV-M12 via Grove G32/G33) ──
-
-static esp_err_t vision_uart_init(void) {
-  uart_config_t uart_cfg = {};
-  uart_cfg.baud_rate = kVisionBaud;
-  uart_cfg.data_bits = UART_DATA_8_BITS;
-  uart_cfg.parity = UART_PARITY_DISABLE;
-  uart_cfg.stop_bits = UART_STOP_BITS_1;
-  uart_cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
-
-  esp_err_t err = uart_driver_install(kVisionUart, kVisionRxBuf * 2, kVisionRxBuf, 0, NULL, 0);
-  if (err != ESP_OK) return err;
-  err = uart_param_config(kVisionUart, &uart_cfg);
-  if (err != ESP_OK) return err;
-  return uart_set_pin(kVisionUart, kVisionTxPin, kVisionRxPin,
-                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-}
-
-static esp_err_t vision_cmd_timeout(const char *cmd, const char *args_json,
-                                    char *resp, size_t resp_size, int timeout_ms) {
-  uint32_t rid = ++s_vision_req_id;
-  char req[256];
-  int n = snprintf(req, sizeof(req),
-                   "{\"cmd\":\"%s\",\"req_id\":\"%" PRIu32 "\",\"args\":%s}\n",
-                   cmd, rid, args_json ? args_json : "{}");
-  if (n >= (int)sizeof(req)) return ESP_ERR_NO_MEM;
-
-  uart_flush_input(kVisionUart);
-
-  int sent = uart_write_bytes(kVisionUart, req, n);
-  if (sent != n) return ESP_FAIL;
-
-  // Read until \n or timeout
-  int pos = 0;
-  TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
-  while (pos < (int)resp_size - 1) {
-    TickType_t now = xTaskGetTickCount();
-    if ((int32_t)(deadline - now) <= 0) return ESP_ERR_TIMEOUT;
-    TickType_t remaining = deadline - now;
-
-    uint8_t byte;
-    int rd = uart_read_bytes(kVisionUart, &byte, 1, remaining);
-    if (rd <= 0) return ESP_ERR_TIMEOUT;
-    if (byte == '\n') break;
-    if (byte >= 0x20) resp[pos++] = (char)byte; // skip control chars
-  }
-  resp[pos] = '\0';
-  if (pos == 0) return ESP_ERR_TIMEOUT;
-
-  rover_log_field_t fields[] = {
-    rover_log_field_str("cmd", cmd),
-    rover_log_field_int("resp_bytes", pos),
-  };
-  rover_log_record_t rec = {
-    .level = ESP_LOG_INFO,
-    .component = TAG,
-    .event = "vision_uart_response",
-    .fields = fields,
-    .field_count = sizeof(fields) / sizeof(fields[0]),
-  };
-  rover_log(&rec);
-  return ESP_OK;
-}
-
-static esp_err_t vision_cmd(const char *cmd, const char *args_json,
-                            char *resp, size_t resp_size) {
-  return vision_cmd_timeout(cmd, args_json, resp, resp_size, kVisionTimeoutMs);
-}
-
-static esp_err_t vision_capture(int quality, uint8_t **jpeg_out, size_t *jpeg_size_out) {
-  *jpeg_out = NULL;
-  *jpeg_size_out = 0;
-
-  uint32_t rid = ++s_vision_req_id;
-  char req[128];
-  int n = snprintf(req, sizeof(req),
-                   "{\"cmd\":\"CAPTURE\",\"req_id\":\"%" PRIu32 "\",\"args\":{\"quality\":%d}}\n",
-                   rid, quality);
-  if (n >= (int)sizeof(req)) return ESP_ERR_NO_MEM;
-
-  uart_flush_input(kVisionUart);
-  int sent = uart_write_bytes(kVisionUart, req, n);
-  if (sent != n) return ESP_FAIL;
-
-  TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(kVisionCaptureTimeoutMs);
-
-  // Phase 1: read JSON header until \n
-  char hdr[256];
-  int pos = 0;
-  while (pos < (int)sizeof(hdr) - 1) {
-    TickType_t now = xTaskGetTickCount();
-    if ((int32_t)(deadline - now) <= 0) return ESP_ERR_TIMEOUT;
-    uint8_t byte;
-    int rd = uart_read_bytes(kVisionUart, &byte, 1, deadline - now);
-    if (rd <= 0) return ESP_ERR_TIMEOUT;
-    if (byte == '\n') break;
-    if (byte >= 0x20) hdr[pos++] = (char)byte;
-  }
-  hdr[pos] = '\0';
-  if (pos == 0) return ESP_ERR_TIMEOUT;
-
-  // Parse JSON header
-  cJSON *root = cJSON_Parse(hdr);
-  if (!root) return ESP_ERR_INVALID_RESPONSE;
-
-  cJSON *ok_field = cJSON_GetObjectItem(root, "ok");
-  if (!cJSON_IsTrue(ok_field)) {
-    cJSON_Delete(root);
-    return ESP_FAIL;
-  }
-
-  cJSON *result = cJSON_GetObjectItem(root, "result");
-  cJSON *size_field = result ? cJSON_GetObjectItem(result, "size") : NULL;
-  if (!size_field || !cJSON_IsNumber(size_field)) {
-    cJSON_Delete(root);
-    return ESP_ERR_INVALID_RESPONSE;
-  }
-  int jpeg_size = size_field->valueint;
-  cJSON_Delete(root);
-
-  if (jpeg_size <= 0 || jpeg_size > kCaptureMaxJpegBytes) return ESP_ERR_INVALID_RESPONSE;
-
-  // Phase 2: read binary JPEG data
-  uint8_t *buf = (uint8_t *)malloc(jpeg_size);
-  if (!buf) return ESP_ERR_NO_MEM;
-
-  int total = 0;
-  while (total < jpeg_size) {
-    TickType_t now = xTaskGetTickCount();
-    if ((int32_t)(deadline - now) <= 0) { free(buf); return ESP_ERR_TIMEOUT; }
-    int want = jpeg_size - total;
-    if (want > kCaptureChunkSize) want = kCaptureChunkSize;
-    int rd = uart_read_bytes(kVisionUart, buf + total, want, deadline - now);
-    if (rd <= 0) { free(buf); return ESP_ERR_TIMEOUT; }
-    total += rd;
-  }
-
-  rover_log_field_t fields[] = {
-    rover_log_field_str("cmd", "CAPTURE"),
-    rover_log_field_int("jpeg_bytes", jpeg_size),
-  };
-  rover_log_record_t rec = {
-    .level = ESP_LOG_INFO,
-    .component = TAG,
-    .event = "vision_capture_ok",
-    .fields = fields,
-    .field_count = sizeof(fields) / sizeof(fields[0]),
-  };
-  rover_log(&rec);
-
-  *jpeg_out = buf;
-  *jpeg_size_out = (size_t)jpeg_size;
-  return ESP_OK;
-}
-
 static esp_err_t rover_init_i2c(void) {
   if (!M5.Ex_I2C.begin(I2C_NUM_0, kI2cSdaPin, kI2cSclPin)) {
     return ESP_FAIL;
@@ -872,7 +1008,6 @@ static inline int clamp_int(int v, int lo, int hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
-static char *cb_vision_capture(const char *fn, const char *arguments, void *ud);
 static void init_ai(void);
 
 static char *make_tool_response(const char *status, const char *action) {
@@ -1443,267 +1578,6 @@ static char *cb_read_imu(const char *fn, const char *arguments, void *ud) {
   return strdup(buf);
 }
 
-static char *cb_vision_scan(const char *fn, const char *arguments, void *ud) {
-  (void)fn; (void)ud;
-  const char *mode = "RELIABLE";
-  cJSON *args = cJSON_Parse(arguments ? arguments : "{}");
-  if (args) {
-    cJSON *m = cJSON_GetObjectItem(args, "mode");
-    if (m && cJSON_IsString(m) && strcasecmp(m->valuestring, "fast") == 0) {
-      mode = "FAST";
-    }
-    cJSON_Delete(args);
-  }
-
-  char cmd_args[64];
-  snprintf(cmd_args, sizeof(cmd_args), "{\"mode\":\"%s\",\"frames\":1}", mode);
-
-  mark_activity();
-  rover_log_record_t rec = {
-    .level = ESP_LOG_INFO,
-    .component = TAG,
-    .event = "tool_vision_scan",
-    .fields = NULL,
-    .field_count = 0,
-  };
-  rover_log(&rec);
-
-  char resp[VISION_RESP_MAX];
-  xSemaphoreTake(s_vision_mutex, portMAX_DELAY);
-  esp_err_t err = vision_cmd("SCAN", cmd_args, resp, sizeof(resp));
-  xSemaphoreGive(s_vision_mutex);
-
-  if (err != ESP_OK) {
-    return make_tool_response("camera_timeout", "vision_scan");
-  }
-
-  // Parse and extract result for clean AI response
-  cJSON *json = cJSON_Parse(resp);
-  if (!json) return strdup(resp);
-
-  cJSON *ok_field = cJSON_GetObjectItem(json, "ok");
-  cJSON *result = cJSON_GetObjectItem(json, "result");
-  if (ok_field && cJSON_IsTrue(ok_field) && result) {
-    bool has_person = false;
-    bool has_objects = false;
-    bool has_face_detection = false;
-    cJSON *person = cJSON_GetObjectItem(result, "person");
-    if (person && cJSON_IsString(person) && person->valuestring) {
-      has_person = (strcmp(person->valuestring, "NONE") != 0);
-    }
-    cJSON *faces_detected = cJSON_GetObjectItem(result, "faces_detected");
-    if (faces_detected && cJSON_IsNumber(faces_detected) && faces_detected->valueint > 0) {
-      has_face_detection = true;
-    }
-    cJSON *objects = cJSON_GetObjectItem(result, "objects");
-    if (objects && cJSON_IsArray(objects) && cJSON_GetArraySize(objects) > 0) {
-      has_objects = true;
-    }
-
-    if (!s_vision_available.load(std::memory_order_relaxed)) {
-      s_vision_available.store(true, std::memory_order_relaxed);
-      rover_log_record_t rec = {
-        .level = ESP_LOG_INFO,
-        .component = TAG,
-        .event = "vision_available_via_ai",
-        .fields = NULL,
-        .field_count = 0,
-      };
-      rover_log(&rec);
-    }
-
-    if (!has_person && !has_face_detection && !has_objects) {
-      rover_log_record_t rec = {
-        .level = ESP_LOG_INFO,
-        .component = TAG,
-        .event = "tool_vision_scan_fallback_capture",
-        .fields = NULL,
-        .field_count = 0,
-      };
-      rover_log(&rec);
-      cJSON_Delete(json);
-      return cb_vision_capture(
-          "vision_capture",
-          "{\"question\":\"The camera scan found no objects or faces. Describe what is visible in the image in detail.\",\"quality\":75}",
-          NULL);
-    }
-
-    char *result_str = cJSON_PrintUnformatted(result);
-    cJSON_Delete(json);
-    return result_str ? result_str : make_tool_response("memory_error", "vision_scan");
-  }
-
-  // Return raw error from camera
-  char *raw = cJSON_PrintUnformatted(json);
-  cJSON_Delete(json);
-  return raw ? raw : make_tool_response("error", "vision_scan");
-}
-
-static char *cb_vision_capture(const char *fn, const char *arguments, void *ud) {
-  (void)fn; (void)ud;
-
-  int quality = kCaptureDefaultQuality;
-  char question[240] = "Describe what is visible in this rover camera image. Be concise and concrete.";
-
-  cJSON *args = cJSON_Parse(arguments ? arguments : "{}");
-  if (args) {
-    cJSON *q = cJSON_GetObjectItem(args, "quality");
-    if (q && cJSON_IsNumber(q)) {
-      quality = q->valueint;
-    }
-    cJSON *prompt = cJSON_GetObjectItem(args, "question");
-    if (prompt && cJSON_IsString(prompt) && prompt->valuestring && prompt->valuestring[0] != '\0') {
-      strlcpy(question, prompt->valuestring, sizeof(question));
-    }
-    cJSON_Delete(args);
-  }
-  quality = clamp_int(quality, 30, 95);
-
-  mark_activity();
-  rover_log_field_t start_fields[] = {
-    rover_log_field_int("quality", quality),
-  };
-  rover_log_record_t start_rec = {
-    .level = ESP_LOG_INFO,
-    .component = TAG,
-    .event = "tool_vision_capture",
-    .fields = start_fields,
-    .field_count = sizeof(start_fields) / sizeof(start_fields[0]),
-  };
-  rover_log(&start_rec);
-
-  if (s_ai_vision == NULL || s_ai_vision_mutex == NULL) {
-    return make_tool_response("ai_vision_unavailable", "vision_capture");
-  }
-  if (s_vision_mutex == NULL) {
-    return make_tool_response("camera_unavailable", "vision_capture");
-  }
-
-  uint8_t *jpeg = NULL;
-  size_t jpeg_size = 0;
-  esp_err_t cap_err = ESP_FAIL;
-  for (int attempt = 1; attempt <= kVisionCaptureRetryCount; ++attempt) {
-    xSemaphoreTake(s_vision_mutex, portMAX_DELAY);
-    cap_err = vision_capture(quality, &jpeg, &jpeg_size);
-    xSemaphoreGive(s_vision_mutex);
-    if (cap_err == ESP_OK && jpeg != NULL && jpeg_size > 0) {
-      break;
-    }
-    if (jpeg != NULL) {
-      free(jpeg);
-      jpeg = NULL;
-      jpeg_size = 0;
-    }
-    if (attempt < kVisionCaptureRetryCount) {
-      rover_log_field_t retry_fields[] = {
-        rover_log_field_int("attempt", attempt),
-        rover_log_field_str("err", esp_err_to_name(cap_err)),
-      };
-      rover_log_record_t retry_rec = {
-        .level = ESP_LOG_DEBUG,
-        .component = TAG,
-        .event = "tool_vision_capture_retry",
-        .fields = retry_fields,
-        .field_count = sizeof(retry_fields) / sizeof(retry_fields[0]),
-      };
-      rover_log(&retry_rec);
-      vTaskDelay(kVisionCaptureRetryDelay);
-    }
-  }
-  if (cap_err != ESP_OK || jpeg == NULL || jpeg_size == 0) {
-    s_vision_available.store(false, std::memory_order_relaxed);
-    rover_log_field_t fields[] = {
-      rover_log_field_str("err", esp_err_to_name(cap_err)),
-    };
-    rover_log_record_t rec = {
-      .level = ESP_LOG_WARN,
-      .component = TAG,
-      .event = "tool_vision_capture_failed",
-      .fields = fields,
-      .field_count = sizeof(fields) / sizeof(fields[0]),
-    };
-    rover_log(&rec);
-    return make_tool_response("camera_capture_failed", "vision_capture");
-  }
-
-  if (!s_vision_available.load(std::memory_order_relaxed)) {
-    s_vision_available.store(true, std::memory_order_relaxed);
-    rover_log_record_t rec = {
-      .level = ESP_LOG_INFO,
-      .component = TAG,
-      .event = "vision_available_via_capture",
-      .fields = NULL,
-      .field_count = 0,
-    };
-    rover_log(&rec);
-  }
-
-  char vision_prompt[768];
-  strlcpy(
-      vision_prompt,
-      "Analyze this rover camera image and answer ONLY as compact JSON with fields: "
-      "target_present (true/false/null), target_label (string), target_position "
-      "(left|center|right|unknown), target_distance (near|mid|far|unknown), "
-      "confidence (0..1), visible_objects (array of strings), scene_summary (string). "
-      "Map common Russian/English synonyms for target objects (sofa/couch/divan, chair/armchair). "
-      "If no specific target is requested, set target_present to null. "
-      "User question: ",
-      sizeof(vision_prompt));
-  strlcat(vision_prompt, question, sizeof(vision_prompt));
-
-  char mm_resp[CHAT_RESPONSE_MAX];
-  mm_resp[0] = '\0';
-  xSemaphoreTake(s_ai_vision_mutex, portMAX_DELAY);
-  esp_err_t mm_err = openrouter_call_with_image_data(
-      s_ai_vision, vision_prompt, jpeg, jpeg_size, mm_resp, sizeof(mm_resp));
-  xSemaphoreGive(s_ai_vision_mutex);
-  free(jpeg);
-
-  if (mm_err != ESP_OK) {
-    rover_log_field_t fields[] = {
-      rover_log_field_str("err", esp_err_to_name(mm_err)),
-    };
-    rover_log_record_t rec = {
-      .level = ESP_LOG_WARN,
-      .component = TAG,
-      .event = "tool_vision_capture_ai_failed",
-      .fields = fields,
-      .field_count = sizeof(fields) / sizeof(fields[0]),
-    };
-    rover_log(&rec);
-    return make_tool_response("ai_vision_failed", "vision_capture");
-  }
-
-  cJSON *out = cJSON_CreateObject();
-  if (!out) {
-    return make_tool_response("memory_error", "vision_capture");
-  }
-  cJSON_AddStringToObject(out, "status", "ok");
-  cJSON_AddStringToObject(out, "action", "vision_capture");
-  cJSON_AddNumberToObject(out, "jpeg_bytes", (double)jpeg_size);
-  cJSON_AddStringToObject(out, "analysis", mm_resp);
-  cJSON *analysis_json = cJSON_Parse(mm_resp);
-  if (analysis_json != NULL) {
-    cJSON_AddItemToObject(out, "analysis_json", analysis_json);
-  }
-  char *payload = cJSON_PrintUnformatted(out);
-  cJSON_Delete(out);
-
-  rover_log_field_t done_fields[] = {
-    rover_log_field_int("jpeg_bytes", (int64_t)jpeg_size),
-  };
-  rover_log_record_t done_rec = {
-    .level = ESP_LOG_INFO,
-    .component = TAG,
-    .event = "tool_vision_capture_done",
-    .fields = done_fields,
-    .field_count = sizeof(done_fields) / sizeof(done_fields[0]),
-  };
-  rover_log(&done_rec);
-
-  return payload ? payload : make_tool_response("memory_error", "vision_capture");
-}
-
 static void chat_worker_task(void *arg) {
   (void)arg;
   chat_job_t job;
@@ -1796,9 +1670,14 @@ static esp_err_t handle_root(httpd_req_t *req) {
       ".pill{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600}"
       "textarea{width:100%;background:#0f172a;color:#e5e7eb;border:1px solid #334155;"
       "border-radius:8px;padding:10px;min-height:80px;resize:vertical}"
+      "input,select{width:100%;background:#0f172a;color:#e5e7eb;border:1px solid #334155;"
+      "border-radius:8px;padding:10px;font-size:14px}"
       "pre{white-space:pre-wrap;word-break:break-word;background:#0f172a;border:1px solid #334155;"
       "border-radius:8px;padding:10px;font-size:13px}"
       ".muted{opacity:.7;font-size:12px}"
+      ".grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}"
+      ".field{display:flex;flex-direction:column;gap:4px;min-width:0}"
+      ".full{grid-column:1 / -1}"
       "#joyWrap{position:relative;margin:0 auto}"
       "canvas{display:block;margin:0 auto;border-radius:50%;background:#0f172a}"
       ".spd-row{display:flex;align-items:center;gap:8px;margin-top:8px}"
@@ -1827,21 +1706,8 @@ static esp_err_t handle_root(httpd_req_t *req) {
       "<button onclick=\"send('open')\">Grip Open</button>"
       "<button onclick=\"send('close')\">Grip Close</button>"
       "</div></div>"
-      /* Vision */
-      "<div class='card'><h2>Vision</h2>"
-      "<div class='row'>"
-      "<button onclick=\"vscan('SCAN')\">Scan</button>"
-      "<button onclick=\"vscan('OBJECTS')\">Objects</button>"
-      "<button onclick=\"vscan('WHO')\">Who</button>"
-      "<button onclick=\"vscan('PING')\">Ping</button>"
-      "<button onclick=\"vcapture()\">Capture</button>"
-      "</div>"
-      "<img id='camImg' style='display:none;max-width:100%;margin-top:8px;"
-      "border-radius:8px;border:1px solid #334155' />"
-      "<pre id='visionOut' style='margin-top:8px;max-height:200px;overflow:auto'>--</pre>"
-      "</div>"
       /* Chat */
-      "<div class='card'><h2>Chat</h2>"
+      "<div class='card' id='chatCard' style='display:none'><h2>Chat</h2>"
       "<textarea id='msg' placeholder='Message for rover AI...'></textarea>"
       "<div class='row' style='margin-top:8px'>"
       "<button onclick='ask()'>Send</button>"
@@ -1850,12 +1716,28 @@ static esp_err_t handle_root(httpd_req_t *req) {
       "<div class='muted' id='chatInfo' style='margin-top:6px'>idle</div>"
       "<pre id='chatOut'></pre>"
       "</div>"
+      /* Settings */
+      "<div class='card'><h2>Settings</h2>"
+      "<div class='grid'>"
+      "<label class='field full'>Wi-Fi network<select id='wifiSsid'></select></label>"
+      "<label class='field full'>Wi-Fi password<input type='password' id='wifiPassword' placeholder='Leave blank to keep current'></label>"
+      "<label class='field full'>LLM endpoint<input type='text' id='llmEndpoint' placeholder='https://.../chat/completions'></label>"
+      "<label class='field'>LLM API key<input type='password' id='llmApiKey' placeholder='Leave blank to keep current'></label>"
+      "<label class='field'>LLM model<input type='text' id='llmModel' placeholder='openai/gpt-4o-mini'></label>"
+      "</div>"
+      "<div class='row' style='margin-top:8px'>"
+      "<button onclick='scanNetworks()'>Rescan</button>"
+      "<button onclick='saveSettings()'>Save</button>"
+      "<button class='danger' onclick='resetSettings()'>Reset</button>"
+      "</div>"
+      "<div class='muted' id='settingsInfo' style='margin-top:6px'>loading...</div>"
+      "</div>"
       /* Script */
       "<script>"
       "const C=document.getElementById('joy'),ctx=C.getContext('2d');"
       "const R=90,DR=30;"
       "let jx=0,jy=0,jDown=false,jTimer=0;"
-      "let holdAct='',holdT=0,lastId=0;"
+      "let holdAct='',holdT=0,lastId=0,selectedWifi='';"
       "const spd=()=>parseInt(document.getElementById('spdSlider').value);"
       "document.getElementById('spdSlider').oninput=function(){document.getElementById('spdVal').textContent=this.value+'%'};"
       /* draw joystick */
@@ -1904,6 +1786,30 @@ static esp_err_t handle_root(httpd_req_t *req) {
       "document.getElementById('stMotion').textContent=j.motion?'Moving x:'+j.x+' y:'+j.y+' z:'+j.z:'Stopped';"
       "document.getElementById('stGrip').textContent='Grip: '+j.gripper;"
       "}catch(e){document.getElementById('stPill').textContent='ERR';}}"
+      "function setSettingsInfo(t){document.getElementById('settingsInfo').textContent=t;}"
+      "function setChatVisible(v){document.getElementById('chatCard').style.display=v?'block':'none';}"
+      "function addWifiOption(sel,ssid,label){const o=document.createElement('option');o.value=ssid;o.textContent=label||ssid;sel.appendChild(o);}"
+      "function populateWifiList(networks,current){const sel=document.getElementById('wifiSsid');const prev=selectedWifi||current||sel.value||'';sel.innerHTML='';"
+      "if(prev && !networks.some(n=>n.ssid===prev)){addWifiOption(sel,prev,prev+' (saved)');}"
+      "if(networks.length===0){addWifiOption(sel,'','No networks found');}"
+      "for(const n of networks){addWifiOption(sel,n.ssid,n.ssid+' ('+n.rssi+' dBm, '+n.auth+')');}"
+      "if(prev)sel.value=prev;selectedWifi=sel.value||prev;}"
+      "async function loadSettings(){try{const r=await fetch('/settings');const j=await r.json();"
+      "if(!j.ok)throw new Error('bad');"
+      "selectedWifi=j.wifi_ssid||selectedWifi||'';"
+      "document.getElementById('llmEndpoint').value=j.llm_endpoint||'';"
+      "document.getElementById('llmModel').value=j.llm_model||'';"
+      "document.getElementById('wifiPassword').value='';"
+      "document.getElementById('llmApiKey').value='';"
+      "setChatVisible(!!j.llm_api_key_set);"
+      "setSettingsInfo(j.wifi_connected?'Wi-Fi connected':(j.wifi_ap_active?'AP active: '+(j.ap_ssid||''):'Wi-Fi offline'));"
+      "if(document.getElementById('wifiSsid').options.length>0){document.getElementById('wifiSsid').value=selectedWifi;}}catch(e){setSettingsInfo('settings load failed');}}"
+      "async function scanNetworks(){setSettingsInfo('scanning Wi-Fi...');try{const r=await fetch('/wifi_scan');const t=await r.text();let j;try{j=JSON.parse(t);}catch(_){throw new Error(t.slice(0,80)||('HTTP '+r.status));}if(!j.ok)throw new Error(j.err||j.error||'bad');populateWifiList(j.networks||[],selectedWifi);setSettingsInfo('found '+(j.networks||[]).length+' networks');}catch(e){setSettingsInfo('scan failed: '+e.message);}}"
+      "async function saveSettings(){const payload={wifi_ssid:document.getElementById('wifiSsid').value||'',wifi_password:document.getElementById('wifiPassword').value||'',llm_endpoint:document.getElementById('llmEndpoint').value||'',llm_api_key:document.getElementById('llmApiKey').value||'',llm_model:document.getElementById('llmModel').value||''};"
+      "setSettingsInfo('saving...');"
+      "const r=await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const t=await r.text();"
+      "try{const j=JSON.parse(t);if(j.reboot){setSettingsInfo('saved, rebooting...');return;}setSettingsInfo('saved');await loadSettings();}catch(e){setSettingsInfo(t);}}"
+      "async function resetSettings(){if(!confirm('Reset Wi-Fi and LLM settings?'))return;setSettingsInfo('resetting...');const r=await fetch('/settings/reset',{method:'POST'});const t=await r.text();try{const j=JSON.parse(t);if(j.reboot){setSettingsInfo('reset, rebooting...');return;}}catch(e){}setSettingsInfo(t);}"
       /* chat */
       "async function ask(){const m=document.getElementById('msg').value.trim();if(!m)return;"
       "document.getElementById('chatInfo').textContent='sending...';"
@@ -1917,26 +1823,8 @@ static esp_err_t handle_root(httpd_req_t *req) {
       "setTimeout(poll,900);return;}"
       "document.getElementById('chatInfo').textContent='done id='+lastId;"
       "document.getElementById('chatOut').textContent=t;}"
-      /* vision */
-      "async function vscan(c){"
-      "document.getElementById('visionOut').textContent='scanning...';"
-      "try{const r=await fetch('/vision?cmd='+c);"
-      "const t=await r.text();"
-      "try{document.getElementById('visionOut').textContent=JSON.stringify(JSON.parse(t),null,2);}"
-      "catch(_){document.getElementById('visionOut').textContent=t;}}"
-      "catch(e){document.getElementById('visionOut').textContent='error: '+e;}}"
-      "async function vcapture(){"
-      "const vo=document.getElementById('visionOut'),img=document.getElementById('camImg');"
-      "vo.textContent='capturing...';"
-      "try{const r=await fetch('/vision?cmd=CAPTURE&quality=75');"
-      "if(!r.ok){vo.textContent='capture failed: '+r.status;return;}"
-      "const b=await r.blob();"
-      "const u=URL.createObjectURL(b);"
-      "img.onload=function(){URL.revokeObjectURL(u);};"
-      "img.src=u;img.style.display='block';"
-      "vo.textContent='captured '+b.size+' bytes';}"
-      "catch(e){vo.textContent='error: '+e;}}"
-      "drawJ();setInterval(refresh,1500);refresh();"
+      "document.getElementById('wifiSsid').onchange=function(){selectedWifi=this.value;};"
+      "Promise.all([refresh(),loadSettings(),scanNetworks()]).finally(()=>setInterval(refresh,1500));"
       "</script></body></html>";
   httpd_resp_set_type(req, "text/html");
   return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
@@ -1951,7 +1839,7 @@ static esp_err_t handle_status(httpd_req_t *req) {
   int n = snprintf(body,
                    sizeof(body),
                    "{\"state\":\"%s\",\"motion\":%d,\"x\":%d,\"y\":%d,\"z\":%d,"
-                   "\"gripper\":\"%s\",\"vision\":\"%s\","
+                   "\"gripper\":\"%s\","
                    "\"bat_pct\":%d,\"vbus_mv\":%d}",
                    state_name(s_rover_state),
                    s_motion_active ? 1 : 0,
@@ -1959,7 +1847,6 @@ static esp_err_t handle_status(httpd_req_t *req) {
                    s_motion_y,
                    s_motion_z,
                    s_gripper_open ? "open" : "close",
-                   s_vision_available.load(std::memory_order_relaxed) ? "ok" : "offline",
                    (int)bat_pct,
                    (int)vbus_mv);
   xSemaphoreGive(s_state_mutex);
@@ -1967,93 +1854,303 @@ static esp_err_t handle_status(httpd_req_t *req) {
   return httpd_resp_send(req, body, n);
 }
 
-static esp_err_t handle_vision(httpd_req_t *req) {
-  char query[96] = {0};
-  char cmd[16] = "SCAN";
-  char mode[16] = "RELIABLE";
-  char quality_str[8] = "";
-  if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-    (void)httpd_query_key_value(query, "cmd", cmd, sizeof(cmd));
-    (void)httpd_query_key_value(query, "mode", mode, sizeof(mode));
-    (void)httpd_query_key_value(query, "quality", quality_str, sizeof(quality_str));
+static bool read_http_body(httpd_req_t *req, char *buf, size_t buf_size) {
+  if (buf_size == 0 || req->content_len >= buf_size) {
+    return false;
+  }
+  size_t total = 0;
+  while (total < req->content_len) {
+    int r = httpd_req_recv(req, buf + total, req->content_len - total);
+    if (r <= 0) {
+      return false;
+    }
+    total += (size_t)r;
+  }
+  buf[total] = '\0';
+  return true;
+}
+
+static void settings_to_json(cJSON *root, const rover_settings_t *settings) {
+  cJSON_AddStringToObject(root, "wifi_ssid", settings->wifi_ssid);
+  cJSON_AddBoolToObject(root, "wifi_password_set", settings->wifi_password[0] != '\0');
+  cJSON_AddStringToObject(root, "llm_endpoint", settings->llm_endpoint);
+  cJSON_AddBoolToObject(root, "llm_api_key_set", settings->llm_api_key[0] != '\0');
+  cJSON_AddStringToObject(root, "llm_model", settings->llm_model);
+  cJSON_AddBoolToObject(root, "wifi_connected", s_wifi_connected.load(std::memory_order_relaxed));
+  cJSON_AddBoolToObject(root, "wifi_ap_active", s_wifi_ap_active.load(std::memory_order_relaxed));
+  cJSON_AddStringToObject(root, "ap_ssid", s_wifi_ap_ssid);
+}
+
+static esp_err_t handle_settings_get(httpd_req_t *req) {
+  rover_settings_t settings = {};
+  settings_snapshot(&settings);
+
+  cJSON *root = cJSON_CreateObject();
+  if (root == NULL) {
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"oom\"}", HTTPD_RESP_USE_STRLEN);
+  }
+  cJSON_AddBoolToObject(root, "ok", true);
+  settings_to_json(root, &settings);
+
+  char *json = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (json == NULL) {
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"oom\"}", HTTPD_RESP_USE_STRLEN);
   }
 
-  // Whitelist commands
-  if (strcmp(cmd, "SCAN") != 0 && strcmp(cmd, "OBJECTS") != 0 &&
-      strcmp(cmd, "WHO") != 0 && strcmp(cmd, "PING") != 0 &&
-      strcmp(cmd, "INFO") != 0 && strcmp(cmd, "CAPTURE") != 0) {
+  httpd_resp_set_type(req, "application/json");
+  esp_err_t send_err = httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+  free(json);
+  return send_err;
+}
+
+static esp_err_t handle_settings_post(httpd_req_t *req) {
+  char body[1024];
+  if (!read_http_body(req, body, sizeof(body))) {
     httpd_resp_set_status(req, "400 Bad Request");
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"invalid cmd\"}", HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"bad body\"}", HTTPD_RESP_USE_STRLEN);
   }
 
-  mark_activity();
+  cJSON *root = cJSON_Parse(body);
+  if (root == NULL) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"invalid json\"}", HTTPD_RESP_USE_STRLEN);
+  }
 
-  // CAPTURE: binary JPEG response
-  if (strcmp(cmd, "CAPTURE") == 0) {
-    int quality = kCaptureDefaultQuality;
-    if (quality_str[0] != '\0') {
-      int q = atoi(quality_str);
-      if (q >= 10 && q <= 95) quality = q;
-    }
-    uint8_t *jpeg = NULL;
-    size_t jpeg_size = 0;
-    xSemaphoreTake(s_vision_mutex, portMAX_DELAY);
-    esp_err_t err = vision_capture(quality, &jpeg, &jpeg_size);
-    xSemaphoreGive(s_vision_mutex);
-    if (err != ESP_OK) {
-      s_vision_available.store(false, std::memory_order_relaxed);
-      httpd_resp_set_status(req, "504 Gateway Timeout");
-      httpd_resp_set_type(req, "application/json");
-      return httpd_resp_send(req, "{\"ok\":false,\"error\":\"capture failed\"}", HTTPD_RESP_USE_STRLEN);
-    }
-    s_vision_available.store(true, std::memory_order_relaxed);
-    httpd_resp_set_type(req, "image/jpeg");
-    esp_err_t send_err = httpd_resp_send(req, (const char *)jpeg, jpeg_size);
-    free(jpeg);
+  rover_settings_t current = {};
+  settings_snapshot(&current);
+  rover_settings_t updated = current;
+
+  settings_copy_if_present(updated.wifi_ssid, sizeof(updated.wifi_ssid),
+                           cJSON_GetObjectItemCaseSensitive(root, "wifi_ssid"));
+  settings_copy_if_present(updated.wifi_password, sizeof(updated.wifi_password),
+                           cJSON_GetObjectItemCaseSensitive(root, "wifi_password"));
+  settings_copy_if_present(updated.llm_endpoint, sizeof(updated.llm_endpoint),
+                           cJSON_GetObjectItemCaseSensitive(root, "llm_endpoint"));
+  settings_copy_if_present(updated.llm_api_key, sizeof(updated.llm_api_key),
+                           cJSON_GetObjectItemCaseSensitive(root, "llm_api_key"));
+  settings_copy_if_present(updated.llm_model, sizeof(updated.llm_model),
+                           cJSON_GetObjectItemCaseSensitive(root, "llm_model"));
+  cJSON_Delete(root);
+
+  esp_err_t save_err = settings_save_to_nvs(&updated);
+  if (save_err != ESP_OK) {
+    rover_log_field_t fields[] = {
+      rover_log_field_str("err", esp_err_to_name(save_err)),
+    };
+    rover_log_record_t rec = {
+      .level = ESP_LOG_ERROR,
+      .component = TAG,
+      .event = "settings_save_failed",
+      .fields = fields,
+      .field_count = sizeof(fields) / sizeof(fields[0]),
+    };
+    rover_log(&rec);
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"save failed\"}", HTTPD_RESP_USE_STRLEN);
+  }
+
+  settings_apply_snapshot(&updated);
+
+  bool wifi_changed = strcmp(current.wifi_ssid, updated.wifi_ssid) != 0 ||
+                      strcmp(current.wifi_password, updated.wifi_password) != 0;
+  bool llm_changed = strcmp(current.llm_endpoint, updated.llm_endpoint) != 0 ||
+                     strcmp(current.llm_api_key, updated.llm_api_key) != 0 ||
+                     strcmp(current.llm_model, updated.llm_model) != 0;
+
+  if (llm_changed && !wifi_changed) {
+    reload_ai_from_settings();
+  }
+
+  rover_log_field_t fields[] = {
+    rover_log_field_bool("wifi_changed", wifi_changed),
+    rover_log_field_bool("llm_changed", llm_changed),
+  };
+  rover_log_record_t rec = {
+    .level = ESP_LOG_INFO,
+    .component = TAG,
+    .event = "settings_saved",
+    .fields = fields,
+    .field_count = sizeof(fields) / sizeof(fields[0]),
+  };
+  rover_log(&rec);
+
+  httpd_resp_set_type(req, "application/json");
+  if (wifi_changed) {
+    esp_err_t send_err = httpd_resp_send(req, "{\"ok\":true,\"reboot\":true}", HTTPD_RESP_USE_STRLEN);
+    vTaskDelay(pdMS_TO_TICKS(150));
+    esp_restart();
     return send_err;
   }
 
-  // Text commands
-  char args_json[64];
-  if (strcmp(cmd, "PING") == 0 || strcmp(cmd, "INFO") == 0) {
-    strlcpy(args_json, "{}", sizeof(args_json));
-  } else {
-    snprintf(args_json, sizeof(args_json), "{\"mode\":\"%s\",\"frames\":1}", mode);
+  return httpd_resp_send(req, "{\"ok\":true,\"reboot\":false}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t handle_settings_reset(httpd_req_t *req) {
+  rover_settings_t defaults = {};
+  settings_set_defaults(&defaults);
+  esp_err_t erase_err = settings_erase_nvs();
+  if (erase_err != ESP_OK) {
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"reset failed\"}", HTTPD_RESP_USE_STRLEN);
   }
 
-  char resp[VISION_RESP_MAX];
-  xSemaphoreTake(s_vision_mutex, portMAX_DELAY);
-  esp_err_t err = vision_cmd(cmd, args_json, resp, sizeof(resp));
-  xSemaphoreGive(s_vision_mutex);
+  settings_apply_snapshot(&defaults);
+  reload_ai_from_settings();
+
+  rover_log_record_t rec = {
+    .level = ESP_LOG_WARN,
+    .component = TAG,
+    .event = "settings_reset",
+    .fields = NULL,
+    .field_count = 0,
+  };
+  rover_log(&rec);
 
   httpd_resp_set_type(req, "application/json");
+  esp_err_t send_err = httpd_resp_send(req, "{\"ok\":true,\"reboot\":true}", HTTPD_RESP_USE_STRLEN);
+  vTaskDelay(pdMS_TO_TICKS(150));
+  esp_restart();
+  return send_err;
+}
+
+static esp_err_t handle_wifi_scan(httpd_req_t *req) {
+  esp_err_t wifi_ready_err = ensure_wifi_stack_initialized();
+  if (wifi_ready_err != ESP_OK) {
+    char body[96];
+    snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"wifi not ready\",\"err\":\"%s\"}",
+             esp_err_to_name(wifi_ready_err));
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+  }
+
+  wifi_mode_t mode = WIFI_MODE_NULL;
+  esp_err_t mode_err = esp_wifi_get_mode(&mode);
+  if (mode_err == ESP_OK && mode == WIFI_MODE_AP) {
+    mode_err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+  }
+  if (mode_err != ESP_OK) {
+    char body[96];
+    snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"scan mode failed\",\"err\":\"%s\"}",
+             esp_err_to_name(mode_err));
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+  }
+
+  esp_err_t start_err = ensure_wifi_started();
+  if (start_err != ESP_OK) {
+    char body[96];
+    snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"wifi start failed\",\"err\":\"%s\"}",
+             esp_err_to_name(start_err));
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+  }
+
+  wifi_scan_config_t scan_cfg = {};
+  scan_cfg.ssid = NULL;
+  scan_cfg.bssid = NULL;
+  scan_cfg.channel = 0;
+  scan_cfg.show_hidden = true;
+  scan_cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+  scan_cfg.scan_time.active.min = 40;
+  scan_cfg.scan_time.active.max = 120;
+
+  esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
   if (err != ESP_OK) {
-    s_vision_available.store(false, std::memory_order_relaxed);
-    httpd_resp_set_status(req, "504 Gateway Timeout");
-    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"camera timeout\"}", HTTPD_RESP_USE_STRLEN);
-  }
-  // Update availability on any successful response
-  if (!s_vision_available.load(std::memory_order_relaxed) && strstr(resp, "\"ok\":true") != NULL) {
-    s_vision_available.store(true, std::memory_order_relaxed);
-    rover_log_record_t rec1 = {
-      .level = ESP_LOG_INFO,
-      .component = TAG,
-      .event = "vision_status_online",
-      .fields = NULL,
-      .field_count = 0,
+    rover_log_field_t fields[] = {
+      rover_log_field_str("err", esp_err_to_name(err)),
     };
-    rover_log(&rec1);
-    rover_log_record_t rec2 = {
-      .level = ESP_LOG_INFO,
+    rover_log_record_t rec = {
+      .level = ESP_LOG_ERROR,
       .component = TAG,
-      .event = "vision_available",
-      .fields = NULL,
-      .field_count = 0,
+      .event = "wifi_scan_failed",
+      .fields = fields,
+      .field_count = sizeof(fields) / sizeof(fields[0]),
     };
-    rover_log(&rec2);
+    rover_log(&rec);
+    char body[96];
+    snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"scan failed\",\"err\":\"%s\"}",
+             esp_err_to_name(err));
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
   }
-  return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+
+  uint16_t ap_count = 0;
+  ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_count));
+  wifi_ap_record_t *records = NULL;
+  if (ap_count > 0) {
+    records = (wifi_ap_record_t *)calloc(ap_count, sizeof(wifi_ap_record_t));
+    if (records == NULL) {
+      httpd_resp_set_status(req, "500 Internal Server Error");
+      return httpd_resp_send(req, "{\"ok\":false,\"error\":\"oom\"}", HTTPD_RESP_USE_STRLEN);
+    }
+    uint16_t count = ap_count;
+    if (esp_wifi_scan_get_ap_records(&count, records) != ESP_OK) {
+      free(records);
+      httpd_resp_set_status(req, "500 Internal Server Error");
+      return httpd_resp_send(req, "{\"ok\":false,\"error\":\"scan read failed\"}", HTTPD_RESP_USE_STRLEN);
+    }
+    ap_count = count;
+  }
+
+  cJSON *root = cJSON_CreateObject();
+  cJSON *networks = cJSON_CreateArray();
+  if (root == NULL || networks == NULL) {
+    if (root) cJSON_Delete(root);
+    free(records);
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"oom\"}", HTTPD_RESP_USE_STRLEN);
+  }
+
+  cJSON_AddBoolToObject(root, "ok", true);
+  cJSON_AddItemToObject(root, "networks", networks);
+
+  for (uint16_t i = 0; i < ap_count; i++) {
+    wifi_ap_record_t *best = &records[i];
+    if (best->ssid[0] == '\0') {
+      continue;
+    }
+
+    for (uint16_t j = (uint16_t)(i + 1); j < ap_count; j++) {
+      wifi_ap_record_t *candidate = &records[j];
+      if (candidate->ssid[0] == '\0') {
+        continue;
+      }
+      if (strcmp((const char *)best->ssid, (const char *)candidate->ssid) == 0) {
+        if (candidate->rssi > best->rssi) {
+          *best = *candidate;
+        }
+        candidate->ssid[0] = '\0';
+      }
+    }
+
+    const wifi_ap_record_t *r = &records[i];
+    if (r->ssid[0] == '\0') {
+      continue;
+    }
+    cJSON *item = cJSON_CreateObject();
+    if (item == NULL) continue;
+    cJSON_AddStringToObject(item, "ssid", (const char *)r->ssid);
+    cJSON_AddNumberToObject(item, "rssi", r->rssi);
+    cJSON_AddNumberToObject(item, "channel", r->primary);
+    cJSON_AddStringToObject(item, "auth", wifi_authmode_name(r->authmode));
+    cJSON_AddItemToArray(networks, item);
+  }
+
+  free(records);
+  char *json = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (json == NULL) {
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"oom\"}", HTTPD_RESP_USE_STRLEN);
+  }
+
+  httpd_resp_set_type(req, "application/json");
+  esp_err_t send_err = httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+  free(json);
+  return send_err;
 }
 
 static esp_err_t handle_cmd(httpd_req_t *req) {
@@ -2237,7 +2334,6 @@ static void start_mdns(void) {
       {(char *)"path", (char *)"/"},
       {(char *)"api_cmd", (char *)"/cmd"},
       {(char *)"api_status", (char *)"/status"},
-      {(char *)"api_vision", (char *)"/vision"},
       {(char *)"api_chat", (char *)"/chat"},
       {(char *)"api_chat_result", (char *)"/chat_result"},
   };
@@ -2260,6 +2356,7 @@ static void start_web_server(void) {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.stack_size = 8192;
+  config.max_uri_handlers = 12;
   ESP_ERROR_CHECK(httpd_start(&s_httpd, &config));
   httpd_handle_t server = s_httpd;
 
@@ -2271,7 +2368,13 @@ static void start_web_server(void) {
   httpd_uri_t chat_result = {
       .uri = "/chat_result", .method = HTTP_GET, .handler = handle_chat_result, .user_ctx = NULL};
   httpd_uri_t status = {.uri = "/status", .method = HTTP_GET, .handler = handle_status, .user_ctx = NULL};
-  httpd_uri_t vision = {.uri = "/vision", .method = HTTP_GET, .handler = handle_vision, .user_ctx = NULL};
+  httpd_uri_t settings_get = {
+      .uri = "/settings", .method = HTTP_GET, .handler = handle_settings_get, .user_ctx = NULL};
+  httpd_uri_t settings_post = {
+      .uri = "/settings", .method = HTTP_POST, .handler = handle_settings_post, .user_ctx = NULL};
+  httpd_uri_t settings_reset = {
+      .uri = "/settings/reset", .method = HTTP_POST, .handler = handle_settings_reset, .user_ctx = NULL};
+  httpd_uri_t wifi_scan = {.uri = "/wifi_scan", .method = HTTP_GET, .handler = handle_wifi_scan, .user_ctx = NULL};
 
   ESP_ERROR_CHECK(httpd_register_uri_handler(server, &root));
   ESP_ERROR_CHECK(httpd_register_uri_handler(server, &cmd));
@@ -2279,16 +2382,28 @@ static void start_web_server(void) {
   ESP_ERROR_CHECK(httpd_register_uri_handler(server, &chat_post));
   ESP_ERROR_CHECK(httpd_register_uri_handler(server, &chat_result));
   ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status));
-  ESP_ERROR_CHECK(httpd_register_uri_handler(server, &vision));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server, &settings_get));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server, &settings_post));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server, &settings_reset));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_scan));
 }
 
 static void init_ai(void) {
+  rover_settings_t settings = {};
+  settings_snapshot(&settings);
+  if (!settings_llm_configured(&settings)) {
+    rover_log_record_t rec = {
+      .level = ESP_LOG_WARN,
+      .component = TAG,
+      .event = "ai_config_missing",
+      .fields = NULL,
+      .field_count = 0,
+    };
+    rover_log(&rec);
+    return;
+  }
+
   static const char *kTurnDirEnum[] = {"left", "right", NULL};
-  static const openrouter_param_t kVisionCaptureParams[] = {
-      {"question", "string", "What to inspect in the camera image (optional).", false, NULL},
-      {"quality", "number", "JPEG quality 30..95 (optional, default 75).", false, NULL},
-      {NULL, NULL, NULL, false, NULL},
-  };
   static const openrouter_param_t kMoveParams[] = {
       {"x", "number", "Lateral speed -100..100 (left negative)", true, NULL},
       {"y", "number", "Forward speed -100..100 (back negative)", true, NULL},
@@ -2309,30 +2424,21 @@ static void init_ai(void) {
       {"gripper_open", "Open the rover gripper.", NULL, cb_gripper_open, NULL},
       {"gripper_close", "Close the rover gripper.", NULL, cb_gripper_close, NULL},
       {"read_imu", "Read current accelerometer and gyroscope values.", NULL, cb_read_imu, NULL},
-      {"vision_scan", "Look at the scene using the camera. Returns detected faces and objects.", NULL, cb_vision_scan, NULL},
-      {"vision_capture", "Capture a camera image and analyze it with a vision model. Use for detailed visual questions.", kVisionCaptureParams, cb_vision_capture, NULL},
   };
 
   openrouter_config_t cfg = {};
-  cfg.api_key = OPENROUTER_API_KEY;
+  cfg.api_key = settings.llm_api_key;
+  cfg.api_base_url = settings.llm_endpoint[0] ? settings.llm_endpoint : NULL;
   cfg.enable_streaming = false;
   cfg.enable_tools = true;
   cfg.http_timeout_ms = kAiHttpTimeoutMs;
   cfg.max_tokens = 256;
-  cfg.default_model = "openai/gpt-4o-mini";
+  cfg.default_model = settings.llm_model[0] ? settings.llm_model : kDefaultLlmModel;
   cfg.default_system_role =
-      "You control a mecanum rover with gripper and a fixed front-facing camera. "
-      "Camera does not pan/tilt; change view only by move() or turn(). "
+      "You control a mecanum rover with gripper. "
       "Use tools directly when user gives a command; do not ask permission first. "
       "If you say you will scan/look/check, call the tool in the same response. "
       "Use move() for timed movement, turn() for angle rotation (IMU), stop() for immediate stop. "
-      "Use vision_scan() for fast structured detections (faces/objects). "
-      "Use vision_capture(question=...) for detailed image understanding (scene, colors, text, named objects). "
-      "For named-object search (sofa/couch/divan, chair/armchair, etc.), prefer vision_capture with a targeted question and synonyms. "
-      "When searching, use the returned object presence and approximate frame position (left/center/right, near/far) to decide turning. "
-      "For sweep search, track total rotation and stop after one full 360-degree sweep unless user explicitly asks to continue. "
-      "If the requested object is found, stop turning immediately and report it. "
-      "vision_scan/vision_capture do not provide precise coordinates or distance; avoid endless move-scan loops. "
       "Respond briefly in the user's language.";
   s_ai = openrouter_create(&cfg);
   if (s_ai == NULL) {
@@ -2353,25 +2459,6 @@ static void init_ai(void) {
     };
     rover_log(&rec2);
     return;
-  }
-
-  openrouter_config_t vision_cfg = cfg;
-  vision_cfg.enable_tools = false;
-  vision_cfg.max_tokens = 192;
-  vision_cfg.default_system_role =
-      "You analyze rover camera images. "
-      "Answer the user's question using the image. "
-      "Be concise, concrete, and avoid speculation.";
-  s_ai_vision = openrouter_create(&vision_cfg);
-  if (s_ai_vision == NULL) {
-    rover_log_record_t rec = {
-      .level = ESP_LOG_WARN,
-      .component = TAG,
-      .event = "ai_vision_init_failed",
-      .fields = NULL,
-      .field_count = 0,
-    };
-    rover_log(&rec);
   }
 
   esp_err_t reg_err = ESP_OK;
@@ -2410,6 +2497,15 @@ static void init_ai(void) {
   }
 }
 
+static void reload_ai_from_settings(void) {
+  if (s_ai_mutex != NULL) xSemaphoreTake(s_ai_mutex, portMAX_DELAY);
+  destroy_ai_handles();
+  if (settings_llm_configured(&s_settings)) {
+    init_ai();
+  }
+  if (s_ai_mutex != NULL) xSemaphoreGive(s_ai_mutex);
+}
+
 static uint32_t state_color(rover_state_t s) {
   switch (s) {
     case STATE_IDLE:             return 0x2D8B2Du; // green
@@ -2433,9 +2529,15 @@ static const char *motion_label(int8_t x, int8_t y, int8_t z) {
 }
 
 static void get_ip_str(char *buf, size_t len) {
-  esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  esp_netif_t *netif = s_wifi_sta_netif != NULL ? s_wifi_sta_netif
+                                                : esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
   esp_netif_ip_info_t ip_info;
   if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+    snprintf(buf, len, IPSTR, IP2STR(&ip_info.ip));
+  } else if (s_wifi_ap_active.load(std::memory_order_relaxed) &&
+             s_wifi_ap_netif != NULL &&
+             esp_netif_get_ip_info(s_wifi_ap_netif, &ip_info) == ESP_OK &&
+             ip_info.ip.addr != 0) {
     snprintf(buf, len, IPSTR, IP2STR(&ip_info.ip));
   } else {
     strlcpy(buf, "---.---.---.---", len);
@@ -2453,12 +2555,15 @@ static void update_local_display(bool btn_a, bool btn_b, bool chat_active) {
   static bool prev_gripper_open = false;
   static bool prev_btn_a = false;
   static bool prev_btn_b = false;
+  static bool prev_wifi_connected = false;
+  static bool prev_wifi_ap_active = false;
   static rover_state_t prev_state = STATE_IDLE;
   static int32_t prev_bat_pct = -1;
 
   int32_t bat_pct = -1;
   read_power_metrics(NULL, &bat_pct);
   bool wifi_connected = s_wifi_connected.load(std::memory_order_relaxed);
+  bool wifi_ap_active = s_wifi_ap_active.load(std::memory_order_relaxed);
   rover_state_t state = STATE_IDLE;
   int8_t motion_x = 0;
   int8_t motion_y = 0;
@@ -2483,6 +2588,8 @@ static void update_local_display(bool btn_a, bool btn_b, bool chat_active) {
       prev_gripper_open == gripper_open &&
       prev_btn_a == btn_a &&
       prev_btn_b == btn_b &&
+      prev_wifi_connected == wifi_connected &&
+      prev_wifi_ap_active == wifi_ap_active &&
       prev_bat_pct == bat_pct) {
     return;
   }
@@ -2495,6 +2602,8 @@ static void update_local_display(bool btn_a, bool btn_b, bool chat_active) {
   prev_gripper_open = gripper_open;
   prev_btn_a = btn_a;
   prev_btn_b = btn_b;
+  prev_wifi_connected = wifi_connected;
+  prev_wifi_ap_active = wifi_ap_active;
   prev_bat_pct = bat_pct;
   initialized = true;
 
@@ -2524,11 +2633,15 @@ static void update_local_display(bool btn_a, bool btn_b, bool chat_active) {
   char ip_str[20];
   get_ip_str(ip_str, sizeof(ip_str));
   M5.Display.fillRoundRect(2, 34, 236, 22, 4, 0x1F2937u);
-  M5.Display.setTextSize(2);
-  M5.Display.setTextColor(wifi_connected ? 0x60A5FAu : 0x6B7280u, 0x1F2937u);
-  int ipw = (int)strlen(ip_str) * 12;
+  const char *net_label = ip_str;
+  int net_label_len = (int)strlen(net_label);
+  bool net_label_small = net_label_len * 12 > 232;
+  M5.Display.setTextSize(net_label_small ? 1 : 2);
+  M5.Display.setTextColor(wifi_connected ? 0x60A5FAu : (wifi_ap_active ? 0xFBBF24u : 0x6B7280u),
+                          0x1F2937u);
+  int ipw = net_label_len * (net_label_small ? 6 : 12);
   M5.Display.setCursor((240 - ipw) / 2, 37);
-  M5.Display.print(ip_str);
+  M5.Display.print(net_label);
 
   // ── Row 2: Motion ──
   if (motion_active) {
@@ -2562,10 +2675,10 @@ static void update_local_display(bool btn_a, bool btn_b, bool chat_active) {
   M5.Display.setCursor(4 + (74 - glw) / 2, py + 5);
   M5.Display.print(gl);
 
-  uint32_t wc = wifi_connected ? 0x1E40AFu : 0x7F1D1Du;
+  uint32_t wc = wifi_connected ? 0x1E40AFu : (wifi_ap_active ? 0xB45309u : 0x7F1D1Du);
   M5.Display.fillRoundRect(82, py, 74, 18, 4, wc);
   M5.Display.setTextColor(TFT_WHITE, wc);
-  const char *wl = wifi_connected ? "WiFi OK" : "OFFLINE";
+  const char *wl = wifi_connected ? "WiFi OK" : (wifi_ap_active ? "AP MODE" : "OFFLINE");
   int wlw = (int)strlen(wl) * 6;
   M5.Display.setCursor(82 + (74 - wlw) / 2, py + 5);
   M5.Display.print(wl);
@@ -2619,6 +2732,9 @@ static void wifi_reconnect_task(void *arg) {
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(15000));
     if (s_wifi_connected.load(std::memory_order_relaxed)) continue;
+    rover_settings_t settings = {};
+    settings_snapshot(&settings);
+    if (!settings_wifi_configured(&settings)) continue;
 
     rover_log_record_t rec = {
       .level = ESP_LOG_INFO,
@@ -2651,6 +2767,7 @@ static void wifi_reconnect_task(void *arg) {
     if (bits & WIFI_CONNECTED_BIT) {
       s_wifi_connected.store(true, std::memory_order_relaxed);
       esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+      stop_wifi_ap_fallback();
 
       s_syslog_sock = open_syslog_socket();
 
@@ -2670,128 +2787,6 @@ static void wifi_reconnect_task(void *arg) {
       };
       rover_log(&rec);
     }
-  }
-}
-
-static void vision_ping_task(void *arg) {
-  (void)arg;
-
-  // Delay the first ping slightly and avoid UART camera traffic in app_main during boot.
-  vTaskDelay(pdMS_TO_TICKS(500));
-  TickType_t last_vision_ping = xTaskGetTickCount() - kVisionPingPeriod;
-  while (1) {
-    TickType_t now = xTaskGetTickCount();
-    if ((now - last_vision_ping) >= kVisionPingPeriod) {
-      last_vision_ping = now;
-      if (xSemaphoreTake(s_vision_mutex, 0) == pdTRUE) {
-        char ping_resp[128];
-        esp_err_t ping_err =
-            vision_cmd_timeout("PING", "{}", ping_resp, sizeof(ping_resp), kVisionPingTimeoutMs);
-        xSemaphoreGive(s_vision_mutex);
-        bool was = s_vision_available.load(std::memory_order_relaxed);
-        bool now_available = false;
-        bool ping_busy = false;
-        bool ping_error_response = false;
-        bool ping_bad_json = false;
-        char ping_error_code[24] = {0};
-
-        if (ping_err == ESP_OK) {
-          cJSON *json = cJSON_Parse(ping_resp);
-          if (json) {
-            cJSON *ok_field = cJSON_GetObjectItem(json, "ok");
-            if (cJSON_IsTrue(ok_field)) {
-              now_available = true;
-            } else if (cJSON_IsFalse(ok_field)) {
-              ping_error_response = true;
-              cJSON *error_obj = cJSON_GetObjectItem(json, "error");
-              cJSON *code_field = error_obj ? cJSON_GetObjectItem(error_obj, "code") : NULL;
-              if (code_field && cJSON_IsString(code_field) && code_field->valuestring) {
-                snprintf(ping_error_code, sizeof(ping_error_code), "%s", code_field->valuestring);
-                if (strcmp(ping_error_code, "BUSY") == 0) {
-                  ping_busy = true;
-                  now_available = true;
-                }
-              }
-            }
-            cJSON_Delete(json);
-          } else {
-            ping_bad_json = true;
-          }
-        }
-
-        s_vision_available.store(now_available, std::memory_order_relaxed);
-        if (ping_err != ESP_OK) {
-          rover_log_field_t fields[] = {
-            rover_log_field_str("result", "error"),
-            rover_log_field_str("err", esp_err_to_name(ping_err)),
-          };
-          rover_log_record_t rec = {
-            .level = ESP_LOG_DEBUG,
-            .component = TAG,
-            .event = "vision_ping",
-            .fields = fields,
-            .field_count = sizeof(fields) / sizeof(fields[0]),
-          };
-          rover_log(&rec);
-        } else if (ping_bad_json) {
-          rover_log_field_t fields[] = {
-            rover_log_field_str("result", "bad_json"),
-            rover_log_field_int("resp_len", (int64_t)strlen(ping_resp)),
-          };
-          rover_log_record_t rec = {
-            .level = ESP_LOG_DEBUG,
-            .component = TAG,
-            .event = "vision_ping",
-            .fields = fields,
-            .field_count = sizeof(fields) / sizeof(fields[0]),
-          };
-          rover_log(&rec);
-        } else if (ping_error_response) {
-          rover_log_field_t fields[4];
-          size_t field_count = 0;
-          fields[field_count++] = rover_log_field_str("result", ping_busy ? "busy" : "error_response");
-          if (ping_error_code[0] != '\0') {
-            fields[field_count++] = rover_log_field_str("error_code", ping_error_code);
-          }
-          fields[field_count++] = rover_log_field_int("resp_len", (int64_t)strlen(ping_resp));
-          rover_log_record_t rec = {
-            .level = ESP_LOG_DEBUG,
-            .component = TAG,
-            .event = "vision_ping",
-            .fields = fields,
-            .field_count = field_count,
-          };
-          rover_log(&rec);
-        } else if (!now_available) {
-          rover_log_field_t fields[] = {
-            rover_log_field_str("result", "bad_response"),
-            rover_log_field_int("resp_len", (int64_t)strlen(ping_resp)),
-          };
-          rover_log_record_t rec = {
-            .level = ESP_LOG_DEBUG,
-            .component = TAG,
-            .event = "vision_ping",
-            .fields = fields,
-            .field_count = sizeof(fields) / sizeof(fields[0]),
-          };
-          rover_log(&rec);
-        }
-        if (now_available != was) {
-          rover_log_field_t fields[] = {
-            rover_log_field_str("status", now_available ? "online" : "offline"),
-          };
-          rover_log_record_t rec = {
-            .level = ESP_LOG_INFO,
-            .component = TAG,
-            .event = "vision_status",
-            .fields = fields,
-            .field_count = sizeof(fields) / sizeof(fields[0]),
-          };
-          rover_log(&rec);
-        }
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
@@ -2968,17 +2963,16 @@ extern "C" void app_main(void) {
   s_i2c_mutex = xSemaphoreCreateMutex();
   s_power_mutex = xSemaphoreCreateMutex();
   s_ai_mutex = xSemaphoreCreateMutex();
-  s_ai_vision_mutex = xSemaphoreCreateMutex();
+  s_settings_mutex = xSemaphoreCreateMutex();
   s_chat_mutex = xSemaphoreCreateMutex();
   s_ai_action_queue_mutex = xSemaphoreCreateMutex();
-  s_vision_mutex = xSemaphoreCreateMutex();
   s_chat_queue = xQueueCreate(1, sizeof(chat_job_t));
   s_syslog_queue = xQueueCreate(8, kSyslogMsgMax);
   s_ai_action_queue = xQueueCreate(kAiActionQueueDepth, sizeof(ai_action_req_t));
   s_ai_action_result_queue = xQueueCreate(kAiActionQueueDepth, sizeof(ai_action_result_t));
   if (s_state_mutex == NULL || s_i2c_mutex == NULL || s_power_mutex == NULL ||
-      s_ai_mutex == NULL || s_ai_vision_mutex == NULL || s_chat_mutex == NULL || s_ai_action_queue_mutex == NULL ||
-      s_vision_mutex == NULL ||
+      s_ai_mutex == NULL || s_settings_mutex == NULL || s_chat_mutex == NULL ||
+      s_ai_action_queue_mutex == NULL ||
       s_chat_queue == NULL || s_syslog_queue == NULL ||
       s_ai_action_queue == NULL || s_ai_action_result_queue == NULL) {
     rover_log_record_t rec = {
@@ -2990,6 +2984,22 @@ extern "C" void app_main(void) {
     };
     rover_log(&rec);
     esp_restart();
+  }
+
+  settings_set_defaults(&s_settings);
+  esp_err_t settings_err = settings_init_from_nvs();
+  if (settings_err != ESP_OK) {
+    rover_log_field_t fields[] = {
+      rover_log_field_str("err", esp_err_to_name(settings_err)),
+    };
+    rover_log_record_t rec = {
+      .level = ESP_LOG_WARN,
+      .component = TAG,
+      .event = "settings_load_failed",
+      .fields = fields,
+      .field_count = sizeof(fields) / sizeof(fields[0]),
+    };
+    rover_log(&rec);
   }
 
   // Unified logger: mirror JSON UART logs to syslog queue.
@@ -3054,35 +3064,10 @@ extern "C" void app_main(void) {
 
   ESP_ERROR_CHECK(rover_init_i2c());
 
-  bool vision_uart_ready = false;
-
-  // Init vision UART (UnitV-M12 on Grove G32/G33)
-  if (vision_uart_init() == ESP_OK) {
-    vision_uart_ready = true;
-    rover_log_field_t fields[] = {
-      rover_log_field_int("tx_pin", 33),
-      rover_log_field_int("rx_pin", 32),
-    };
-    rover_log_record_t rec = {
-      .level = ESP_LOG_INFO,
-      .component = TAG,
-      .event = "vision_uart_initialized",
-      .fields = fields,
-      .field_count = sizeof(fields) / sizeof(fields[0]),
-    };
-    rover_log(&rec);
-  } else {
-    rover_log_record_t rec = {
-      .level = ESP_LOG_ERROR,
-      .component = TAG,
-      .event = "vision_uart_init_failed",
-      .fields = NULL,
-      .field_count = 0,
-    };
-    rover_log(&rec);
-  }
-
-  draw_boot_status("connecting WiFi...", WIFI_SSID);
+  rover_settings_t boot_settings = {};
+  settings_snapshot(&boot_settings);
+  draw_boot_status("connecting WiFi...",
+                   boot_settings.wifi_ssid[0] ? boot_settings.wifi_ssid : "Wi-Fi not set");
   esp_err_t wifi_err = wifi_connect_blocking();
 
   if (wifi_err == ESP_OK) {
@@ -3109,12 +3094,24 @@ extern "C" void app_main(void) {
     init_ai();
     start_mdns();
     start_web_server();
-    draw_boot_status("ready",
-                     s_vision_available.load(std::memory_order_relaxed) ? "web + chat + cam"
-                                                                        : "web + chat online");
+    draw_boot_status("ready", "web + chat online");
   } else {
     // Offline fallback — no restart, buttons still work
     s_wifi_connected.store(false, std::memory_order_relaxed);
+    esp_err_t ap_err = start_wifi_ap_fallback();
+    if (ap_err != ESP_OK) {
+      rover_log_field_t fields[] = {
+        rover_log_field_str("err", esp_err_to_name(ap_err)),
+      };
+      rover_log_record_t ap_rec = {
+        .level = ESP_LOG_ERROR,
+        .component = TAG,
+        .event = "wifi_ap_start_failed",
+        .fields = fields,
+        .field_count = sizeof(fields) / sizeof(fields[0]),
+      };
+      rover_log(&ap_rec);
+    }
     rover_log_record_t rec = {
       .level = ESP_LOG_WARN,
       .component = TAG,
@@ -3123,7 +3120,8 @@ extern "C" void app_main(void) {
       .field_count = 0,
     };
     rover_log(&rec);
-    draw_boot_status("OFFLINE", "buttons only");
+    draw_boot_status(ap_err == ESP_OK ? "AP MODE" : "OFFLINE",
+                     ap_err == ESP_OK ? s_wifi_ap_ssid : "buttons only");
 
     s_gripper_open = true;
     (void)rover_set_servo_angle(kGripperServo, kGripperOpenAngle);
@@ -3131,6 +3129,10 @@ extern "C" void app_main(void) {
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     transition_to(STATE_OFFLINE_FALLBACK);
     xSemaphoreGive(s_state_mutex);
+
+    if (ap_err == ESP_OK && s_httpd == NULL) {
+      start_web_server();
+    }
   }
 
   mark_activity();
@@ -3143,11 +3145,6 @@ extern "C" void app_main(void) {
 
   // WiFi reconnect task — Core 1, low priority
   xTaskCreatePinnedToCore(wifi_reconnect_task, "wifi_reconn", 4096, NULL, 2, NULL, 1);
-
-  // Vision ping task — Core 1, low priority (keeps camera health checks off main_loop)
-  if (vision_uart_ready) {
-    xTaskCreatePinnedToCore(vision_ping_task, "vision_ping", 4096, NULL, 2, NULL, 1);
-  }
 
   // Main loop — Core 0 (RT core, motors, buttons, display)
   xTaskCreatePinnedToCore(main_loop_task, "main_loop", 4096, NULL, 5, NULL, 0);

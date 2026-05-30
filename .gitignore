@@ -5,9 +5,6 @@
 # Local library mirrors (reference-only, not tracked)
 libraries/
 
-# Local secrets (do not commit)
-include/secrets.h
-
 # Logs and local runtime artifacts
 *.log
 log/
