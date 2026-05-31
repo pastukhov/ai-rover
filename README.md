@@ -1,127 +1,158 @@
-# AI Rover (M5StickC Plus + RoverC Pro)
+# AI Rover
 
-## Русский
+AI Rover - небольшой робот на базе **M5StickC Plus** и **RoverC Pro**. Он умеет ездить на колёсах Mecanum, управлять захватом, показывать состояние на экране и открывать веб-пульт управления по Wi-Fi.
 
-Проект прошивки для **M5StickC Plus** (контроллер) и **RoverC Pro** (база с моторами и захватом) на PlatformIO.
+Проект готовится как подарок для ребёнка, который занимается робототехникой, поэтому документация разделена на быстрый старт, пользовательское руководство и технические заметки.
 
-### Возможности
-- Управление движением RoverC Pro.
-- Управление захватом (открыть/закрыть).
-- Demo-сценарий по кнопке `BtnA`.
-- Аварийный стоп по кнопке `BtnB`.
-- Веб‑интерфейс управления по Wi‑Fi.
-- Статус на экране: текущее действие, батарея, Wi‑Fi.
-- Структурные JSON‑логи в UART и syslog через единый логгер `rover_log(...)`.
+## Документация
 
-### Структура
-- `src/main_idf.cpp` — основная логика прошивки (ESP‑IDF / PlatformIO).
-- `src/logger_json.{h,cpp}` — единый structured logger (UART + syslog mirror).
-- `platformio.ini` — конфигурация PlatformIO.
-- `include/secrets.h` — локальные Wi‑Fi креды (не коммитится).
-- `include/secrets.h.example` — шаблон секретов.
-- `docs/` — документация и планы.
-- `docs/logging-conventions.md` — схема и naming для JSON‑логов.
+| Документ | Для кого | Что внутри |
+|---|---|---|
+| [Быстрый старт для Алёны](docs/quick-start.md) | Ребёнок и взрослый рядом | Первое включение, подключение, первые миссии |
+| [Руководство пользователя](docs/user-guide.md) | Пользователь ровера | Управление, Wi-Fi, LLM, экран, troubleshooting |
+| [Технические заметки](docs/technical-notes.md) | Взрослый помощник, разработчик, кружок | Архитектура, сборка, прошивка, диагностика |
+| [RoverC Pro](docs/roverc-pro.md) | Разработчик | Аппаратные сведения и I2C-протокол |
+| [Logging conventions](docs/logging-conventions.md) | Разработчик | Формат JSON-логов |
 
-### Быстрый старт
-1. Создайте `include/secrets.h` по шаблону `include/secrets.h.example`.
-2. Сборка:
-```bash
-pio run
-```
-3. Прошивка:
-```bash
-pio run --target upload
-```
-4. Монитор порта:
-```bash
-pio device monitor --baud 115200
-```
+## Что умеет текущая прошивка
 
-### Веб‑управление
-После подключения к Wi‑Fi ровер поднимает HTTP-сервер на порту `80`.
-IP отображается на экране устройства (`WiFi: x.x.x.x`).
-Откройте в браузере:
-```text
-http://<IP_ровера>/
-```
-Ровер так же аннонсирует себя посредством mDNS и доступен по адресу [ai-rover.local](http://ai-rover.local)
+- Управление движением RoverC Pro через веб-интерфейс.
+- Открытие и закрытие gripper-захвата.
+- Аварийная остановка через веб-кнопку **STOP** и аппаратную кнопку **BtnB**.
+- Demo-сценарий по **BtnA**.
+- Экранный статус: режим сети, IP-адрес, состояние движения и захвата.
+- Wi-Fi STA/AP fallback:
+  - если сохранённая Wi-Fi-сеть доступна, ровер подключается к ней;
+  - если Wi-Fi не настроен или недоступен, ровер поднимает открытую точку доступа `AI-Rover-XXXX`.
+- Веб-настройки Wi-Fi:
+  - scan сетей;
+  - выбор SSID из списка;
+  - ввод пароля;
+  - сохранение в NVS.
+- Веб-настройки LLM:
+  - OpenAI-compatible endpoint;
+  - API key;
+  - model.
+- Чат скрыт, пока LLM API key не настроен.
+- Структурные JSON-логи через `rover_log(...)`.
 
-Откройте в браузере:
+Камера и vision-инструменты в актуальной версии прошивки удалены.
+
+## Первый запуск без домашнего Wi-Fi
+
+1. Включите RoverC Pro.
+2. Дождитесь надписи **AP MODE** на экране.
+3. Подключитесь с телефона или компьютера к Wi-Fi-сети:
 
 ```text
-http://<IP_ровера>/
+AI-Rover-XXXX
 ```
 
-или
+Пароля нет.
+
+4. Откройте IP-адрес с экрана. Обычно в AP-режиме это:
+
+```text
+http://192.168.4.1/
+```
+
+5. На веб-странице можно управлять ровером и задать домашний Wi-Fi.
+
+## Запуск в домашней сети
+
+Если Wi-Fi уже настроен, ровер подключится к домашней сети и покажет IP-адрес на экране.
+
+Откройте:
+
+```text
+http://<IP-на-экране>/
+```
+
+Иногда также работает mDNS-адрес:
 
 ```text
 http://ai-rover.local/
 ```
 
+IP на экране надёжнее, чем mDNS.
 
-### Безопасность
-- Не коммитьте `include/secrets.h`.
-- Проверьте `.gitignore` перед пушем.
+## Сборка
 
-### Логи и наблюдаемость
-- Все runtime-логи приложения идут в JSON через `rover_log(...)`.
-- Один и тот же JSON пишется в UART и зеркалится в syslog.
-- Бизнес-логика не должна вызывать `send_syslog()` напрямую.
-- Формат и naming событий: `docs/logging-conventions.md`.
+Обычная команда:
 
----
-
-## English
-
-Firmware project for **M5StickC Plus** (controller) and **RoverC Pro** (motor/gripper base) using PlatformIO.
-
-### Features
-- RoverC Pro motion control.
-- Gripper control (open/close).
-- Demo sequence on `BtnA`.
-- Emergency stop on `BtnB`.
-- Wi‑Fi web control page.
-- On-screen status: current action, battery, Wi‑Fi.
-- Structured JSON logs to UART and syslog via the unified `rover_log(...)` logger.
-
-### Structure
-- `src/main_idf.cpp` — main firmware logic (ESP-IDF / PlatformIO).
-- `src/logger_json.{h,cpp}` — unified structured logger (UART + syslog mirror).
-- `platformio.ini` — PlatformIO configuration.
-- `include/secrets.h` — local Wi‑Fi credentials (ignored by git).
-- `include/secrets.h.example` — credentials template.
-- `docs/` — hardware notes and plans.
-- `docs/logging-conventions.md` — JSON log schema and event naming rules.
-
-### Quick Start
-1. Create `include/secrets.h` from `include/secrets.h.example`.
-2. Build:
 ```bash
 pio run
 ```
-3. Flash:
+
+В локальной среде этого репозитория:
+
+```bash
+PLATFORMIO_CORE_DIR=.pio-core ./.venv/bin/pio run
+```
+
+## Прошивка
+
 ```bash
 pio run --target upload
 ```
-4. Serial monitor:
+
+Или через локальную среду:
+
+```bash
+PLATFORMIO_CORE_DIR=.pio-core ./.venv/bin/pio run --target upload
+```
+
+## Serial monitor
+
 ```bash
 pio device monitor --baud 115200
 ```
 
-### Web Control
-After joining Wi‑Fi, the rover starts an HTTP server on port `80`.
-The device screen shows its IP (`WiFi: x.x.x.x`).
-Open:
-```text
-http://<rover_ip>/
+Через локальную среду:
+
+```bash
+PLATFORMIO_CORE_DIR=.pio-core ./.venv/bin/pio device monitor --baud 115200
 ```
 
-### Security
-- Do not commit `include/secrets.h`.
-- Verify `.gitignore` before pushing.
+## Структура проекта
 
-### Logs & Observability
-- All application runtime logs are emitted as JSON through `rover_log(...)`.
-- The same JSON line is written to UART and mirrored to syslog.
-- Business logic should not call `send_syslog()` directly.
-- Log schema and event naming conventions are documented in `docs/logging-conventions.md`.
+| Путь | Назначение |
+|---|---|
+| `src/main_idf.cpp` | Основная логика прошивки ESP-IDF |
+| `src/logger_json.h`, `src/logger_json.cpp` | Единый structured logger |
+| `platformio.ini` | Конфигурация PlatformIO |
+| `docs/` | Пользовательская и техническая документация |
+| `libraries/` | Локальные reference-копии библиотек и примеров |
+| `mempalace.yaml`, `entities.json` | Локальные файлы MemPalace для проекта |
+
+## Настройки и секреты
+
+В актуальной прошивке нет `include/secrets.h`.
+
+Wi-Fi и LLM-настройки задаются через веб-интерфейс и сохраняются во внутренней NVS-памяти устройства.
+
+Это удобно для подарочного сценария: устройство можно включить, подключиться к его точке доступа и настроить без пересборки прошивки.
+
+## Безопасность
+
+- Не запускайте ровера рядом с краем стола.
+- Держите **STOP** или **BtnB** под рукой при экспериментах.
+- AP-режим открыт без пароля, поэтому используйте его для настройки, а не как постоянный режим в публичном месте.
+- Не коммитьте реальные API keys, дампы NVS или личные сетевые пароли.
+
+## Разработка
+
+Минимальная проверка перед изменениями прошивки:
+
+1. `pio run`
+2. `pio run --target upload`
+3. `pio device monitor --baud 115200`
+4. Проверка веб-интерфейса и аппаратной остановки **BtnB**
+
+Логи приложения должны идти через:
+
+```cpp
+rover_log(const rover_log_record_t *record)
+```
+
+Не вызывайте transport-функции логгера напрямую из бизнес-логики.
